@@ -1,5 +1,7 @@
 #include "TestUtil.h"
+#include "modules/optional/Otp/OtpEntropy.h"
 #include "modules/optional/Otp/OtpLink.h"
+#include <string.h>
 #include <deque>
 #include <unity.h>
 
@@ -194,6 +196,112 @@ static void test_simultaneous_requests_resolve_to_one_generator()
     TEST_ASSERT_EQUAL_UINT32(0, a.failures + b.failures);
 }
 
+
+// entropy gate: xorshift32 blocks stay below 2% trips over 512 KiB (measured 0.53%), structured streams trip early
+static uint8_t xorshift(uint32_t &x)
+{
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return (uint8_t)(x >> 8);
+}
+
+static void test_entropy_gate_passes_xorshift_blocks()
+{
+    int trips = 0;
+    uint32_t seed = 12345;
+    for (int run = 0; run < 400; run++) {
+        uint32_t x = (seed = seed * 1664525u + 1013904223u) ^ ((uint32_t)run * 2654435761u);
+        Entropy e;
+        for (uint32_t i = 0; i < BLOCK_BYTES; i++) {
+            if (!e.feed(xorshift(x))) {
+                trips++;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT_LESS_OR_EQUAL_INT(8, trips);
+}
+
+static unsigned tripsAt(uint8_t (*gen)(unsigned i))
+{
+    Entropy e;
+    for (unsigned i = 0; i < 4096; i++)
+        if (!e.feed(gen(i)))
+            return i;
+    return 0;
+}
+
+static uint8_t genText(unsigned i)
+{
+    static const char s[] = "all work and no play makes jack a dull boy, the quick brown fox jumps over the lazy dog ";
+    return (uint8_t)s[i % (sizeof(s) - 1)];
+}
+static uint8_t genZero(unsigned) { return 0; }
+static uint8_t genCounter(unsigned i) { return (uint8_t)i; }
+static uint8_t genStep3(unsigned i) { return (uint8_t)(i * 3 + 7); }
+static uint8_t genRepeat64(unsigned i)
+{
+    static uint8_t pat[64];
+    static bool init = false;
+    if (!init) {
+        uint32_t x = 99;
+        for (auto &b : pat)
+            b = xorshift(x);
+        init = true;
+    }
+    return pat[i % 64];
+}
+static uint8_t genBiased(unsigned)
+{
+    static uint32_t x = 7;
+    return xorshift(x) & xorshift(x);
+}
+
+static void test_entropy_gate_trips_on_structure()
+{
+    TEST_ASSERT_GREATER_THAN_UINT32(0, tripsAt(genText));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, tripsAt(genZero));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, tripsAt(genCounter));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, tripsAt(genStep3));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, tripsAt(genRepeat64));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, tripsAt(genBiased));
+}
+
+static uint8_t crc8Ref(const uint8_t *p, size_t n)
+{
+    uint8_t c = 0;
+    while (n--) {
+        c ^= *p++;
+        for (int i = 0; i < 8; i++)
+            c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x07) : (uint8_t)(c << 1);
+    }
+    return c;
+}
+
+static void test_acceptor_rejects_structured_block()
+{
+    Wire in, out;
+    FakePort p(&in, &out);
+    Link b(p, 3);
+    b.start(now);
+    // peer asks to generate (REQ), we accept, then it streams zeros
+    uint8_t req[7] = {SYNC, T_REQ, 1, 2, 3, 4, 0};
+    req[6] = crc8Ref(req + 1, 5);
+    for (uint8_t v : req)
+        in.q.push_back(v);
+    for (int i = 0; i < 5 && b.state() != ACCEPT; i++, now++)
+        b.poll(now);
+    TEST_ASSERT_EQUAL(ACCEPT, b.state());
+    for (int i = 0; i < 2000; i++)
+        in.q.push_back(0);
+    for (int i = 0; i < 20 && b.state() == ACCEPT; i++, now++)
+        b.poll(now);
+    TEST_ASSERT_EQUAL(SLEEP, b.state());
+    TEST_ASSERT_EQUAL_UINT32(1, b.failures);
+    TEST_ASSERT_NOT_NULL(strstr(b.rx.text[b.rx.cur], "low entropy"));
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -211,6 +319,9 @@ void setup()
     RUN_TEST(test_junk_byte_when_linked_resets);
     RUN_TEST(test_key_starts_new_handshake_without_failure);
     RUN_TEST(test_simultaneous_requests_resolve_to_one_generator);
+    RUN_TEST(test_entropy_gate_passes_xorshift_blocks);
+    RUN_TEST(test_entropy_gate_trips_on_structure);
+    RUN_TEST(test_acceptor_rejects_structured_block);
     exit(UNITY_END());
 }
 

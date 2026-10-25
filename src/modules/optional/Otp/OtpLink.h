@@ -1,6 +1,7 @@
 #pragma once
 
 #include "OtpConfig.h"
+#include "OtpEntropy.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -74,6 +75,7 @@ class Link
     uint8_t buf[8];
     uint8_t pos = 0;
     uint32_t myNonce = 0, sendRng = 0, checkRng = 0, sentCnt = 0, doneCnt = 0;
+    Entropy gate; // every block byte passes it, on both ends
     uint8_t txRing[6] = {}, rxRing[6] = {};
     uint32_t txN = 0, rxN = 0;
 };

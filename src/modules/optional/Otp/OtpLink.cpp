@@ -132,6 +132,7 @@ void Link::beginData(State s, uint32_t now)
     lastProgress = lastLog = now;
     sendRng = checkRng = myNonce ? myNonce : 1;
     pos = 0;
+    gate.reset();
 }
 
 void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
@@ -237,6 +238,10 @@ void Link::pumpGen(uint32_t now)
         uint8_t want = nextByte(checkRng);
         if (c != want)
             return fail(now, "echo %u: %02x not %02x", (unsigned)doneCnt, c, want);
+
+        // echo matches, but is the stream itself still random
+        if (!gate.feed((uint8_t)c))
+            return fail(now, "low entropy at %u", (unsigned)doneCnt);
         rxRing[rxN++ % 6] = (uint8_t)c;
         doneCnt++;
         lastProgress = now;
@@ -264,6 +269,11 @@ void Link::pumpAccept(uint32_t now)
     for (int n = 0; n < 256 && port.writable() > 0 && (c = port.read()) >= 0; n++) {
         everRx = true;
         lastRx = now;
+
+        // acceptor judges the stream before echoing it back
+        if (!gate.feed((uint8_t)c))
+            return fail(now, "low entropy at %u", (unsigned)doneCnt);
+
         port.write((uint8_t)c);
         rxRing[rxN++ % 6] = (uint8_t)c;
         doneCnt++;
