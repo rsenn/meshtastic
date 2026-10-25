@@ -194,19 +194,19 @@ void Suite::poll(uint32_t now)
             idx++;
             return;
         }
+        if (!link.startRun(c.run, now))
+            return;
         seqAtStart = link.result().seq;
         startedAt = now;
-
-        // twice the wire time of the block plus slack for handshake and relink
-        timeoutMs = (uint32_t)((uint64_t)c.run.kib * 1024 * 10 * 2000 / c.run.baud) + 8000;
-        link.startRun(c.run, now);
         waiting = true;
         return;
     }
 
     if (link.result().seq != seqAtStart) {
         judge(link.result(), now);
-    } else if (now - startedAt > timeoutMs) {
+    } else if (link.state() == LINKED && now - startedAt > IDLE_TIMEOUT_MS) {
+        // a block keeps the link out of LINKED until its own stall timeouts end it (hardware: 4 kB/s, not the wire speed),
+        // so only an idle link that never produced a result is a hang: stray byte and skipped heartbeat cases, or a lost REQ
         Result none;
         snprintf(none.reason, sizeof(none.reason), "no result");
         none.ok = cases[idx].expect[0] ? true : false; // an expected failure that never came is a failure, a hang too

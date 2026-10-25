@@ -52,7 +52,8 @@ class Suite
     Case cases[16];
     unsigned n = 0, idx = 0;
     unsigned seqAtStart = 0;
-    uint32_t startedAt = 0, finishedAt = 0, timeoutMs = 0;
+    static constexpr uint32_t IDLE_TIMEOUT_MS = 8000; // idle link, no result
+    uint32_t startedAt = 0, finishedAt = 0;
     unsigned okCount = 0, failCount = 0, skipCount = 0;
     uint32_t bestBaud = OTP_BAUD; // highest speed whose speed-group block passed
     char lastLine[32] = "";

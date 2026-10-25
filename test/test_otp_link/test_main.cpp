@@ -597,6 +597,38 @@ static void test_tuning_group_reports_every_window()
     TEST_ASSERT_TRUE(log.has("window 1024"));
 }
 
+// hardware log 2026-10-25: the loop turn is ~14 ms (LCD, scheduler), a 128 byte window moves ~4.4 kB/s whatever the baud, and
+// the blocks of the speed group took far longer than the wire time; the suite must wait for them instead of timing out
+static void test_suite_waits_for_slow_blocks()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Lines log;
+    Link a(pa, 307), b(pb, 308);
+    Suite s(a, &log);
+    startBoth(a, b);
+    for (uint32_t i = 0; i < 40000 && !(a.state() == LINKED && b.state() == LINKED); i++, now++)
+        if (i % 14 == 0) {
+            a.poll(now);
+            b.poll(now);
+        }
+    TEST_ASSERT_EQUAL(LINKED, a.state());
+    for (uint32_t i = 0; i < 3000 && !s.press(now); i++, now++)
+        if (i % 14 == 0) {
+            a.poll(now);
+            b.poll(now);
+        }
+    TEST_ASSERT_TRUE(s.running());
+    for (uint32_t i = 0; i < 1500000 && s.running(); i++, now++)
+        if (i % 14 == 0) {
+            a.poll(now);
+            b.poll(now);
+            s.poll(now);
+        }
+    TEST_ASSERT_FALSE(s.running());
+    TEST_ASSERT_TRUE(log.has("suite speed done 8 ok 0 failed 0 skipped"));
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -627,6 +659,7 @@ void setup()
     RUN_TEST(test_fault_suite_passes_on_two_peers);
     RUN_TEST(test_fault_suite_passes_in_loopback);
     RUN_TEST(test_tuning_group_reports_every_window);
+    RUN_TEST(test_suite_waits_for_slow_blocks);
     exit(UNITY_END());
 }
 
