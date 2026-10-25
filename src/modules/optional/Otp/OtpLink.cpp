@@ -27,15 +27,6 @@ static uint8_t crc8(const uint8_t *p, size_t n)
     return c;
 }
 
-// xorshift32: stand-in for real entropy, one byte per step.
-static uint8_t nextByte(uint32_t &x)
-{
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    return (uint8_t)(x >> 8);
-}
-
 static uint32_t le32(const uint8_t *p)
 {
     return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
@@ -59,7 +50,7 @@ void Rows::clear()
 
 uint32_t Link::random()
 {
-    return nextByte(rng) | (uint32_t)nextByte(rng) << 8 | (uint32_t)nextByte(rng) << 16 | (uint32_t)nextByte(rng) << 24;
+    return xorshift8(rng) | (uint32_t)xorshift8(rng) << 8 | (uint32_t)xorshift8(rng) << 16 | (uint32_t)xorshift8(rng) << 24;
 }
 
 void Link::setBaud(uint32_t baud)
@@ -157,6 +148,11 @@ void Link::fail(uint32_t now, const char *fmt, ...)
     failures++;
 
     // always wake up at the base speed, the peer does the same after its own timeout
+    if (glitching) {
+        // fault GLITCH left the port at 9600, curBaud does not know
+        port.setBaud(curBaud);
+        glitching = false;
+    }
     setBaud(OTP_BAUD);
 }
 
@@ -221,6 +217,20 @@ bool Link::startRun(const Run &r, uint32_t now)
     if (state_ != LINKED)
         return false;
     want = r;
+
+    // these two break the idle link instead of starting a block
+    if (r.fault == STRAY) {
+        const uint8_t junk = 0x55;
+        tx.put("fault: stray byte");
+        send(&junk, 1, now);
+        return true;
+    }
+    if (r.fault == SKIP_HB) {
+        tx.put("fault: skip a heartbeat");
+        skipHb = true;
+        return true;
+    }
+
     tx.put("key: new handshake");
     sendReq(now);
     return true;
@@ -252,7 +262,9 @@ void Link::beginData(State s, uint32_t now)
     blockBytes = run_.kib * 1024u;
 
     // both ends derive the stream from the nonce of the REQ
-    sendRng = checkRng = myNonce ? myNonce : 1;
+    sendS = Stream(run_.src, myNonce);
+    checkS = sendS;
+    stalled = glitching = false;
     pos = 0;
     gate.reset();
 
@@ -333,6 +345,7 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
             // our own REQ came back: loopback, we are generator and acceptor in one
             rx.put("own REQ back: loopback");
             gen = true;
+            loop_ = true;
             negoAt = now;
             state_ = NEGO;
             sendSpd(want.baud, want.kib, want.dump, now);
@@ -345,6 +358,7 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
                 return;
             myNonce = nonce;
             gen = false;
+            loop_ = false;
             negoAt = now;
             run_ = Run();
             state_ = NEGO;
@@ -355,6 +369,7 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
         if (state_ == REQ && nonce == myNonce) {
             rx.put("ACC %08x", (unsigned)nonce);
             gen = true;
+            loop_ = false;
             negoAt = now;
             state_ = NEGO;
             sendSpd(want.baud, want.kib, want.dump, now);
@@ -439,6 +454,29 @@ void Link::finish(uint32_t now)
     setBaud(OTP_BAUD);
 }
 
+// fault hits the byte at faultAt; false means do not send it
+bool Link::inject(uint8_t &b, uint32_t now)
+{
+    switch (run_.fault) {
+    case FLIP:
+        b ^= 0x40;
+        break;
+    case DROP:
+        return false;
+    case STALL:
+        stalled = true;
+        return false;
+    case GLITCH:
+        port.setBaud(9600);
+        glitching = true;
+        glitchAt = now;
+        break;
+    default:
+        break;
+    }
+    return true;
+}
+
 void Link::pumpGen(uint32_t now)
 {
     sampleLoop();
@@ -446,7 +484,7 @@ void Link::pumpGen(uint32_t now)
     for (int n = 0; n < 256 && doneCnt < blockBytes && (c = port.read()) >= 0; n++) {
         everRx = true;
         lastRx = now;
-        uint8_t want = nextByte(checkRng);
+        uint8_t want = checkS.next();
         if (c != want)
             return fail(now, "echo %u: %02x not %02x", (unsigned)doneCnt, c, want);
 
@@ -465,12 +503,21 @@ void Link::pumpGen(uint32_t now)
     if (doneCnt >= blockBytes)
         return finish(now);
 
+    // fault GLITCH: back to the run speed after 100 ms
+    if (glitching && elapsed(now, glitchAt) >= 100) {
+        port.setBaud(curBaud);
+        glitching = false;
+    }
+
     // keep at most `window` bytes unechoed in flight, the UART buffers are small
-    for (int n = 0; n < 256 && sentCnt < blockBytes && sentCnt - doneCnt < run_.window && port.writable() > 0; n++) {
-        uint8_t b = nextByte(sendRng);
-        port.write(b);
-        sendUs = port.us();
-        txRing[txN++ % 6] = b;
+    for (int n = 0; n < 256 && !stalled && sentCnt < blockBytes && sentCnt - doneCnt < run_.window && port.writable() > 0; n++) {
+        uint8_t b = sendS.next();
+        bool send = sentCnt != run_.faultAt || inject(b, now);
+        if (send) {
+            port.write(b);
+            sendUs = port.us();
+            txRing[txN++ % 6] = b;
+        }
         sentCnt++;
     }
     if (elapsed(now, lastProgress) >= STALL_MS)
@@ -526,7 +573,8 @@ void Link::poll(uint32_t now)
     case SWITCH:
         // silent; the acceptor changes speed first, the generator a bit later, then both drop what the change left in RX
         if (elapsed(now, switchAt) >= (gen ? SWITCH_GEN_MS : SWITCH_ACC_MS)) {
-            setBaud(run_.baud);
+            if (!(gen && run_.fault == NO_SWITCH))
+                setBaud(run_.baud);
             while (port.read() >= 0)
                 ;
             beginData(switchTo, now);
@@ -543,7 +591,10 @@ void Link::poll(uint32_t now)
     if ((state_ == BEAT || state_ == LINKED) && elapsed(now, lastBeat) >= BEAT_MS) {
         lastBeat = now;
         const uint8_t hb[2] = {SYNC, T_HB};
-        send(hb, sizeof(hb), now);
+        if (skipHb)
+            skipHb = false;
+        else
+            send(hb, sizeof(hb), now);
     }
     int c;
     bool got = false;

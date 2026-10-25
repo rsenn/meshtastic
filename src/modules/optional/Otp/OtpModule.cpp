@@ -135,10 +135,10 @@ void OtpModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
         snprintf(txStatus, sizeof(txStatus), "asking %c", beat);
         break;
     case otp::GEN:
-        snprintf(txStatus, sizeof(txStatus), "generator %u%%", (unsigned)((uint64_t)link.done() * 100 / otp::BLOCK_BYTES));
+        snprintf(txStatus, sizeof(txStatus), "generator %u%%", (unsigned)((uint64_t)link.done() * 100 / link.total()));
         break;
     case otp::ACCEPT:
-        snprintf(txStatus, sizeof(txStatus), "acceptor %u%%", (unsigned)((uint64_t)link.done() * 100 / otp::BLOCK_BYTES));
+        snprintf(txStatus, sizeof(txStatus), "acceptor %u%%", (unsigned)((uint64_t)link.done() * 100 / link.total()));
         break;
     case otp::LINKED:
         snprintf(txStatus, sizeof(txStatus), "beat %c", beat);

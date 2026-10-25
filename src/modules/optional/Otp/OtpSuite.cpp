@@ -1,0 +1,218 @@
+#if defined(OTP_APP) || defined(PIO_UNIT_TESTING)
+
+#include "OtpSuite.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+namespace otp
+{
+const char *Suite::name(Group g)
+{
+    static const char *const names[] = {"none", "speed", "faults", "tuning"};
+    return names[g];
+}
+
+void Suite::say(const char *fmt, ...)
+{
+    if (!log)
+        return;
+    char s[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof(s), fmt, ap);
+    va_end(ap);
+    log->line(s);
+}
+
+void Suite::add(const char *nm, const Run &r, const char *expect, bool needPeer)
+{
+    if (n >= sizeof(cases) / sizeof(cases[0]))
+        return;
+    Case &c = cases[n++];
+    snprintf(c.name, sizeof(c.name), "%s", nm);
+    c.run = r;
+    snprintf(c.expect, sizeof(c.expect), "%s", expect);
+    c.needPeer = needPeer;
+}
+
+void Suite::plan(Group g)
+{
+    n = idx = 0;
+    char nm[16];
+    Run r;
+
+    if (g == SPEED) {
+        // block size grows with the speed, about 1.3 s of wire time each; 115200 quiet is the baseline for the LCD cost
+        // against the demo's hexdump
+        static const struct {
+            uint32_t baud;
+            unsigned kib;
+        } steps[] = {{115200, 16}, {230400, 32}, {460800, 64}, {921600, 128}, {2000000, 256}, {3000000, 384}, {4000000, 512}, {5000000, 512}};
+        for (auto &st : steps) {
+            snprintf(nm, sizeof(nm), "%u", (unsigned)st.baud);
+            r = Run();
+            r.baud = st.baud;
+            r.kib = st.kib;
+            add(nm, r, "");
+        }
+    } else if (g == FAULTS) {
+        // fresh random block must pass, then every kind of bad data and bad link must be noticed
+        r = Run();
+        r.kib = 16;
+        add("E0 random", r, "");
+        static const struct {
+            const char *nm;
+            Source src;
+        } bad[] = {{"E1 text", TEXT}, {"E2 zeros", ZEROS}, {"E3 counter", COUNTER}, {"E4 repeat64", REPEAT64}, {"E5 biased", BIASED}};
+        for (auto &e : bad) {
+            r = Run();
+            r.kib = 16;
+            r.src = e.src;
+            // two devices: the acceptor trips first and goes silent, so the generator sees a stall; its log has the real reason
+            add(e.nm, r, "low entropy|stall");
+        }
+        static const struct {
+            const char *nm;
+            Fault f;
+            uint32_t baud;
+            const char *expect;
+        } broken[] = {
+            {"L1 flip", FLIP, 115200, "echo"},
+            {"L2 drop", DROP, 115200, "echo"},
+            {"L3 stall", STALL, 115200, "stall"},
+            {"L4 glitch", GLITCH, 115200, "echo|stall|low entropy"},
+            {"L7 noswitch", NO_SWITCH, 921600, "echo|stall|low entropy"},
+        };
+        for (auto &e : broken) {
+            r = Run();
+            r.kib = 16;
+            r.baud = e.baud;
+            r.fault = e.f;
+            // a speed fault shows only between two UARTs
+            add(e.nm, r, e.expect, e.f == GLITCH || e.f == NO_SWITCH);
+        }
+
+        // idle link faults: the peer drops out, so the generator sees its heartbeat vanish (a loopback sees its own junk)
+        r = Run();
+        r.kib = 1;
+        r.fault = STRAY;
+        add("L5 stray", r, "HB missed|junk byte");
+        r.fault = SKIP_HB;
+        add("L6 skiphb", r, "HB missed|HB after");
+    } else if (g == TUNING) {
+        // round trips first (window 1), then the window sweep, all at the best clean speed of the speed group
+        r = Run();
+        r.baud = bestBaud;
+        r.kib = 1;
+        r.window = 1;
+        add("rtt", r, "");
+        static const unsigned windows[] = {16, 32, 64, 128, 256, 512, 1024};
+        for (unsigned w : windows) {
+            snprintf(nm, sizeof(nm), "win %u", w);
+            r = Run();
+            r.baud = bestBaud;
+            r.kib = 32;
+            r.window = w;
+            add(nm, r, "");
+        }
+    }
+}
+
+bool Suite::press(uint32_t now)
+{
+    if (running_ || !link.demoDone() || !link.peerAlive(now))
+        return false;
+    group = next_;
+    next_ = group == SPEED ? FAULTS : group == FAULTS ? TUNING : SPEED;
+    plan(group);
+    running_ = true;
+    waiting = false;
+    okCount = failCount = skipCount = 0;
+    finishedAt = now;
+    say("suite %s start, %u cases", name(group), n);
+    return true;
+}
+
+// reason contains one of the substrings in expect, split at '|'
+bool Suite::matches(const char *reason, const char *expect)
+{
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%s", expect);
+    for (char *p = strtok(buf, "|"); p; p = strtok(nullptr, "|"))
+        if (strstr(reason, p))
+            return true;
+    return false;
+}
+
+void Suite::judge(const Result &r, uint32_t now)
+{
+    Case &c = cases[idx];
+    bool pass;
+    char got[48];
+    if (!c.expect[0]) {
+        pass = r.ok;
+        if (r.ok)
+            snprintf(got, sizeof(got), "ok %u B/s", (unsigned)r.bytesPerSec);
+        else
+            snprintf(got, sizeof(got), "%s", r.reason);
+
+        // the speed group remembers how fast it went
+        if (pass && group == SPEED && r.baud > bestBaud)
+            bestBaud = r.baud;
+    } else {
+        pass = !r.ok && matches(r.reason, c.expect);
+        snprintf(got, sizeof(got), "%s", r.ok ? "no failure" : r.reason);
+    }
+    say("case %s expected \"%s\" got \"%s\" %s", c.name, c.expect[0] ? c.expect : "ok", got, pass ? "PASS" : "FAIL");
+    snprintf(lastLine, sizeof(lastLine), "%s %s", c.name, pass ? "PASS" : "FAIL");
+    pass ? okCount++ : failCount++;
+    idx++;
+    waiting = false;
+    finishedAt = now;
+}
+
+void Suite::poll(uint32_t now)
+{
+    if (!running_)
+        return;
+
+    if (idx >= n) {
+        say("suite %s done %u ok %u failed %u skipped", name(group), okCount, failCount, skipCount);
+        running_ = false;
+        return;
+    }
+
+    if (!waiting) {
+        // one second of settled heartbeat between cases, a failed case left both ends silent for 1..3 s
+        if (!link.peerAlive(now) || now - finishedAt < 1000)
+            return;
+        Case &c = cases[idx];
+        if (c.needPeer && link.loopback()) {
+            say("case %s skipped: loopback", c.name);
+            skipCount++;
+            idx++;
+            return;
+        }
+        seqAtStart = link.result().seq;
+        startedAt = now;
+
+        // twice the wire time of the block plus slack for handshake and relink
+        timeoutMs = (uint32_t)((uint64_t)c.run.kib * 1024 * 10 * 2000 / c.run.baud) + 8000;
+        link.startRun(c.run, now);
+        waiting = true;
+        return;
+    }
+
+    if (link.result().seq != seqAtStart) {
+        judge(link.result(), now);
+    } else if (now - startedAt > timeoutMs) {
+        Result none;
+        snprintf(none.reason, sizeof(none.reason), "no result");
+        none.ok = cases[idx].expect[0] ? true : false; // an expected failure that never came is a failure, a hang too
+        judge(none, now);
+    }
+}
+} // namespace otp
+
+#endif

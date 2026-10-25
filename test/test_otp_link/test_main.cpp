@@ -1,6 +1,7 @@
 #include "TestUtil.h"
 #include "modules/optional/Otp/OtpEntropy.h"
 #include "modules/optional/Otp/OtpLink.h"
+#include "modules/optional/Otp/OtpSuite.h"
 #include <string.h>
 #include <deque>
 #include <string>
@@ -100,7 +101,7 @@ static void test_loopback_reaches_linked()
     Link a(p, 1234);
     a.start(now);
     TEST_ASSERT_TRUE(runUntil(a, nullptr, LINKED, 10000));
-    TEST_ASSERT_EQUAL_UINT32(BLOCK_BYTES, a.done());
+    TEST_ASSERT_EQUAL_UINT32(BLOCK_KIB * 1024u, a.done());
     TEST_ASSERT_EQUAL_UINT32(0, a.failures);
 }
 
@@ -240,6 +241,8 @@ static uint8_t xorshift(uint32_t &x)
     return (uint8_t)(x >> 8);
 }
 
+static const uint32_t GATE_BLOCK = 512u * 1024u; // the false positive rate is quoted per 512 KiB
+
 static void test_entropy_gate_passes_xorshift_blocks()
 {
     int trips = 0;
@@ -247,7 +250,7 @@ static void test_entropy_gate_passes_xorshift_blocks()
     for (int run = 0; run < 400; run++) {
         uint32_t x = (seed = seed * 1664525u + 1013904223u) ^ ((uint32_t)run * 2654435761u);
         Entropy e;
-        for (uint32_t i = 0; i < BLOCK_BYTES; i++) {
+        for (uint32_t i = 0; i < GATE_BLOCK; i++) {
             if (!e.feed(xorshift(x))) {
                 trips++;
                 break;
@@ -324,8 +327,8 @@ static void test_acceptor_rejects_structured_block()
     req[6] = crc8Ref(req + 1, 5);
     for (uint8_t v : req)
         in.q.push_back(v);
-    // then its SPD: 115200, 512k, no dump
-    uint8_t spd[10] = {SYNC, T_SPD, 0x00, 0xC2, 0x01, 0x00, 0x00, 0x02, 0, 0};
+    // then its SPD: 115200, 16k, no dump
+    uint8_t spd[10] = {SYNC, T_SPD, 0x00, 0xC2, 0x01, 0x00, 0x10, 0x00, 0, 0}; // 16 KiB
     spd[9] = crc8Ref(spd + 1, 8);
     for (int i = 0; i < 5 && b.state() != NEGO; i++, now++)
         b.poll(now);
@@ -448,12 +451,12 @@ static void test_result_and_log_lines_of_a_block()
     const Result &r = a.result();
     TEST_ASSERT_EQUAL_UINT32(1, r.seq);
     TEST_ASSERT_TRUE(r.ok);
-    TEST_ASSERT_EQUAL_UINT32(BLOCK_BYTES, r.bytes);
+    TEST_ASSERT_EQUAL_UINT32(BLOCK_KIB * 1024u, r.bytes);
     TEST_ASSERT_GREATER_THAN_UINT32(0, r.bytesPerSec);
     TEST_ASSERT_TRUE(log.has("link open"));
     TEST_ASSERT_TRUE(log.has("peer detected"));
-    TEST_ASSERT_TRUE(log.has("block start GEN 512k 115200 baud"));
-    TEST_ASSERT_TRUE(log.has("block ok GEN 512k"));
+    TEST_ASSERT_TRUE(log.has("block start GEN 16k 115200 baud"));
+    TEST_ASSERT_TRUE(log.has("block ok GEN 16k"));
 }
 
 static void test_failure_gives_result_with_reason_and_log_line()
@@ -497,6 +500,103 @@ static void test_single_byte_window_measures_round_trips()
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1000, a.result().rtt.min);
 }
 
+static unsigned count(const std::string &s, const char *what)
+{
+    unsigned n = 0;
+    for (size_t p = s.find(what); p != std::string::npos; p = s.find(what, p + 1))
+        n++;
+    return n;
+}
+
+// press the key until a group runs, drive both ends until it is finished
+static void runGroup(Suite &s, Link &a, Link *b, uint32_t maxMs)
+{
+    // a key press is refused until the heartbeat is flowing again
+    for (int i = 0; i < 8000 && !s.press(now); i++, now++) {
+        a.poll(now);
+        if (b)
+            b->poll(now);
+    }
+    TEST_ASSERT_TRUE(s.running());
+    for (uint32_t i = 0; i < maxMs && s.running(); i++, now++) {
+        a.poll(now);
+        if (b)
+            b->poll(now);
+        s.poll(now);
+    }
+    TEST_ASSERT_FALSE(s.running());
+}
+
+static void test_fault_suite_passes_on_two_peers()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Lines log;
+    Link a(pa, 301), b(pb, 302);
+    Suite s(a, &log);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
+    for (int i = 0; i < 1000; i++, now++) { // heartbeats settle
+        a.poll(now);
+        b.poll(now);
+    }
+    s.press(now); // speed group first, let it go: next press is the faults group
+    for (uint32_t i = 0; i < 400000 && s.running(); i++, now++) {
+        a.poll(now);
+        b.poll(now);
+        s.poll(now);
+    }
+    TEST_ASSERT_FALSE(s.running());
+    TEST_ASSERT_EQUAL(Suite::FAULTS, s.next());
+    log.all.clear();
+    runGroup(s, a, &b, 600000);
+    TEST_ASSERT_TRUE(log.has("suite faults done 13 ok 0 failed 0 skipped"));
+    TEST_ASSERT_EQUAL_UINT32(13, count(log.all, " PASS"));
+    TEST_ASSERT_EQUAL_UINT32(0, count(log.all, " FAIL"));
+}
+
+static void test_fault_suite_passes_in_loopback()
+{
+    Wire w;
+    FakePort p(&w, &w);
+    Lines log;
+    Link a(p, 303);
+    Suite s(a, &log);
+    a.start(now);
+    TEST_ASSERT_TRUE(runUntil(a, nullptr, LINKED, 20000));
+    for (int i = 0; i < 1000; i++, now++)
+        a.poll(now);
+    s.press(now);
+    for (uint32_t i = 0; i < 400000 && s.running(); i++, now++) {
+        a.poll(now);
+        s.poll(now);
+    }
+    log.all.clear();
+    runGroup(s, a, nullptr, 600000);
+    TEST_ASSERT_TRUE(log.has("suite faults done 11 ok 0 failed 2 skipped"));
+}
+
+static void test_tuning_group_reports_every_window()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Lines log;
+    Link a(pa, 305), b(pb, 306);
+    a.setLogger(&log);
+    Suite s(a, &log);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
+    for (int i = 0; i < 1000; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    for (int g = 0; g < 3; g++) // speed, faults, tuning
+        runGroup(s, a, &b, 800000);
+    TEST_ASSERT_TRUE(log.has("suite tuning done 8 ok 0 failed 0 skipped"));
+    TEST_ASSERT_TRUE(log.has("rtt 1024 round trips"));
+    TEST_ASSERT_TRUE(log.has("window 1024"));
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -524,6 +624,9 @@ void setup()
     RUN_TEST(test_result_and_log_lines_of_a_block);
     RUN_TEST(test_failure_gives_result_with_reason_and_log_line);
     RUN_TEST(test_single_byte_window_measures_round_trips);
+    RUN_TEST(test_fault_suite_passes_on_two_peers);
+    RUN_TEST(test_fault_suite_passes_in_loopback);
+    RUN_TEST(test_tuning_group_reports_every_window);
     exit(UNITY_END());
 }
 

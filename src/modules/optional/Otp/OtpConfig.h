@@ -31,7 +31,6 @@ constexpr unsigned NEGO_MS = 300;       // SPD must follow ACC and be answered w
 constexpr unsigned SWITCH_ACC_MS = 10;  // acceptor switches this long after its SPD reply left the wire
 constexpr unsigned SWITCH_GEN_MS = 40;  // generator waits longer, so the acceptor is always at the new speed first
 constexpr uint32_t MAX_BAUD = 5000000;  // ESP32-S3 UART ceiling, the acceptor never grants more
-constexpr unsigned BLOCK_KIB = 512;
-constexpr uint32_t BLOCK_BYTES = BLOCK_KIB * 1024u;
+constexpr unsigned BLOCK_KIB = 16; // demo block: 1.4 s at 115200, tests scale the size with the speed
 constexpr uint32_t WINDOW = 128; // unechoed bytes in flight
 } // namespace otp
