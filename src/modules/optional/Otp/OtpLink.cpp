@@ -70,8 +70,61 @@ void Link::setBaud(uint32_t baud)
     curBaud = baud;
 }
 
+// host log line, formatted only when somebody listens
+void Link::note(const char *fmt, ...)
+{
+    if (!logger)
+        return;
+    char s[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof(s), fmt, ap);
+    va_end(ap);
+    logger->line(s);
+}
+
+// close the books on one run: result for the caller, one log line (block end or error)
+void Link::endRun(bool ok, const char *reason, uint32_t now)
+{
+    bool data = state_ == GEN || state_ == ACCEPT;
+    Result &r = result_;
+    unsigned seq = r.seq + 1;
+    r = Result();
+    r.seq = seq;
+    r.ok = ok;
+    snprintf(r.reason, sizeof(r.reason), "%s", reason);
+    r.baud = run_.baud;
+    r.kib = run_.kib;
+    r.window = run_.window;
+    r.gen = gen;
+    r.bytes = data ? doneCnt : 0;
+    r.ms = data ? elapsed(now, runStart) : 0;
+    r.bytesPerSec = r.ms ? (uint32_t)((uint64_t)r.bytes * 1000 / r.ms) : 0;
+    r.gapUs = gapUs;
+    r.ringHigh = ringHigh;
+    r.errs = port.errors() - errsAtStart;
+    r.rtt = rtt;
+}
+
+// data phase bookkeeping, once per poll: loop gap and RX ring fill
+void Link::sampleLoop()
+{
+    uint32_t t = port.us();
+    if (lastPollUs && t - lastPollUs > gapUs)
+        gapUs = t - lastPollUs;
+    lastPollUs = t;
+    int av = port.available();
+    if (av > 0 && (unsigned)av > ringHigh)
+        ringHigh = av;
+}
+
 void Link::start(uint32_t now)
 {
+    note(opened ? "idle: silence over, heartbeat" : "link open, heartbeat");
+    if (!opened) {
+        opened = true;
+        linkOpenAt = now;
+    }
     state_ = BEAT;
     lastBeat = now - BEAT_MS;
     hbValid = false;
@@ -89,9 +142,14 @@ void Link::fail(uint32_t now, const char *fmt, ...)
     va_end(ap);
     rx.put("FAIL %s", msg);
 
+    // result and log line first: they need the state the failure interrupted
+    sleepFor = SLEEP_MIN_MS + random() % SLEEP_SPAN_MS;
+    endRun(false, msg, now);
+    note("FAIL %s | %uk done, %ums, %u baud, silent %ums", msg, (unsigned)(result_.bytes / 1024), (unsigned)result_.ms,
+         (unsigned)curBaud, (unsigned)sleepFor);
+
     // stop talking at once; silence is what resyncs the peer (its own timeout fires within 600 ms)
     sleepAt = now;
-    sleepFor = SLEEP_MIN_MS + random() % SLEEP_SPAN_MS;
     tx.put("silent %ums", (unsigned)sleepFor);
     state_ = SLEEP;
     hbValid = false;
@@ -197,6 +255,15 @@ void Link::beginData(State s, uint32_t now)
     sendRng = checkRng = myNonce ? myNonce : 1;
     pos = 0;
     gate.reset();
+
+    // fresh numbers for this run
+    runStart = now;
+    lastPollUs = gapUs = 0;
+    ringHigh = 0;
+    rtt = Rtt();
+    errsAtStart = port.errors();
+    note("block start %s %uk %u baud window %u nonce %08x", gen ? "GEN" : "ACC", run_.kib, (unsigned)run_.baud, run_.window,
+         (unsigned)myNonce);
 }
 
 // SPD arrives in NEGO only: acceptor gets the question, generator gets the answer
@@ -237,6 +304,7 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
     if (type == T_HB) {
         if (state_ == BEAT) {
             rx.put("HB: peer is there");
+            note("peer detected (HB) %ums after open, %u baud", (unsigned)elapsed(now, linkOpenAt), (unsigned)curBaud);
             if (demoDone_) {
                 // link proven once already: heartbeat is enough, no block after a fault
                 state_ = LINKED;
@@ -271,6 +339,8 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
         } else if (state_ == BEAT || state_ == LINKED || (state_ == REQ && nonce > myNonce)) {
             // peer generates; with two REQs in the air the higher nonce wins
             rx.put("REQ %08x", (unsigned)nonce);
+            if (state_ == BEAT)
+                note("peer detected (REQ) %ums after open, %u baud", (unsigned)elapsed(now, linkOpenAt), (unsigned)curBaud);
             if (!sendNonce(T_ACC, nonce, now))
                 return;
             myNonce = nonce;
@@ -349,6 +419,14 @@ void Link::hexLine(Rows &r, const char *tag, const uint8_t *ring, uint32_t n)
 
 void Link::finish(uint32_t now)
 {
+    endRun(true, "", now);
+    const Result &r = result_;
+    note("block ok %s %uk %ums %u B/s window %u gap %uus ring %u err ovf %u/%u frm %u par %u brk %u", gen ? "GEN" : "ACC",
+         (unsigned)(r.bytes / 1024), (unsigned)r.ms, (unsigned)r.bytesPerSec, (unsigned)r.window, (unsigned)r.gapUs, r.ringHigh,
+         r.errs.fifo, r.errs.ring, r.errs.frame, r.errs.parity, r.errs.brk);
+    if (r.rtt.n)
+        note("rtt %u round trips min %u avg %u max %u us", (unsigned)r.rtt.n, (unsigned)r.rtt.min, (unsigned)r.rtt.avg(),
+             (unsigned)r.rtt.max);
     rx.put("block of %uk ok", (unsigned)(doneCnt / 1024));
     tx.put("block done: connected");
     state_ = LINKED;
@@ -363,6 +441,7 @@ void Link::finish(uint32_t now)
 
 void Link::pumpGen(uint32_t now)
 {
+    sampleLoop();
     int c;
     for (int n = 0; n < 256 && doneCnt < blockBytes && (c = port.read()) >= 0; n++) {
         everRx = true;
@@ -375,6 +454,10 @@ void Link::pumpGen(uint32_t now)
         if (!gate.feed((uint8_t)c))
             return fail(now, "low entropy at %u", (unsigned)doneCnt);
 
+        // window 1 is the round trip probe: byte out to byte back, in microseconds
+        if (run_.window == 1)
+            rtt.add(port.us() - sendUs);
+
         rxRing[rxN++ % 6] = (uint8_t)c;
         doneCnt++;
         lastProgress = now;
@@ -386,6 +469,7 @@ void Link::pumpGen(uint32_t now)
     for (int n = 0; n < 256 && sentCnt < blockBytes && sentCnt - doneCnt < run_.window && port.writable() > 0; n++) {
         uint8_t b = nextByte(sendRng);
         port.write(b);
+        sendUs = port.us();
         txRing[txN++ % 6] = b;
         sentCnt++;
     }
@@ -400,6 +484,7 @@ void Link::pumpGen(uint32_t now)
 
 void Link::pumpAccept(uint32_t now)
 {
+    sampleLoop();
     int c;
     for (int n = 0; n < 256 && port.writable() > 0 && (c = port.read()) >= 0; n++) {
         everRx = true;

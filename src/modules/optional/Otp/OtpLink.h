@@ -2,6 +2,7 @@
 
 #include "OtpConfig.h"
 #include "OtpEntropy.h"
+#include "OtpStats.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -14,7 +15,10 @@ struct Port {
     virtual int writable() = 0; // free TX bytes
     virtual void write(uint8_t b) = 0;
     virtual void setBaud(uint32_t baud) {}
-    virtual void flush() {} // returns when the last byte has left the wire
+    virtual void flush() {}                   // returns when the last byte has left the wire
+    virtual int available() { return 0; }     // bytes waiting in the RX ring
+    virtual uint32_t us() { return 0; }       // microsecond clock, wraps
+    virtual Errs errors() { return Errs(); }  // receive errors since power-up
 };
 
 // Fixed rows, the newest line overwrites the oldest: nothing scrolls, the screen just redraws all rows.
@@ -64,6 +68,8 @@ class Link
     const Run &run() const { return run_; }
     uint32_t baud() const { return curBaud; }
     bool demoDone() const { return demoDone_; }
+    const Result &result() const { return result_; }
+    void setLogger(Logger *l) { logger = l; }
     uint32_t revision() const { return rx.rev + tx.rev + failures; }
 
     Rows rx, tx;
@@ -85,6 +91,9 @@ class Link
     void finish(uint32_t now);
     void fail(uint32_t now, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
     void setBaud(uint32_t baud);
+    void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    void endRun(bool ok, const char *reason, uint32_t now);
+    void sampleLoop();
     bool framing() const { return state_ == BEAT || state_ == REQ || state_ == NEGO || state_ == LINKED; }
     void hexLine(Rows &r, const char *tag, const uint8_t *ring, uint32_t n);
     uint32_t random();
@@ -110,12 +119,22 @@ class Link
     uint32_t lastLog = 0;                // hexdump and heartbeat log throttles
     uint32_t lastProgress = 0;           // last byte of the data phase
     bool everRx = false, hbValid = false;
+    bool opened = false;                 // start() ran once
     uint8_t buf[10];                     // frame being received
     uint8_t pos = 0;                     // bytes in buf, 0 = no open frame
     uint32_t myNonce = 0;                // nonce of our REQ, or the one we accepted
     uint32_t sendRng = 0, checkRng = 0;  // block generator and its mirror for the echo check
     uint32_t sentCnt = 0, doneCnt = 0;   // bytes sent, bytes echoed and verified
     Entropy gate;                        // every block byte passes it, on both ends
+    Logger *logger = nullptr;            // host log, may be null
+    Result result_;                      // newest finished run
+    Rtt rtt;                             // round trips of the current run
+    Errs errsAtStart;                    // UART errors when the data phase began
+    uint32_t runStart = 0;               // data phase began, ms
+    uint32_t lastPollUs = 0, gapUs = 0;  // loop gap tracking during the data phase
+    uint32_t sendUs = 0;                 // when the single byte in flight left (window 1)
+    unsigned ringHigh = 0;               // RX ring fill high water of the run
+    uint32_t linkOpenAt = 0;             // first start(), for the peer detected message
     uint8_t txRing[6] = {}, rxRing[6] = {}; // last bytes for the hexdump rows
     uint32_t txN = 0, rxN = 0;
 };

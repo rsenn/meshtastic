@@ -3,6 +3,7 @@
 #include "modules/optional/Otp/OtpLink.h"
 #include <string.h>
 #include <deque>
+#include <string>
 #include <unity.h>
 
 // Serial link state machine of the OTP demo screen: heartbeat, handshake with role pick, 512k echo
@@ -10,6 +11,18 @@
 // Regression guarded: a failure must leave both ends silent and able to link again.
 
 using namespace otp;
+
+struct Lines : Logger {
+    std::string all;
+    void line(const char *s) override
+    {
+        all += s;
+        all += '\n';
+    }
+    bool has(const char *s) const { return all.find(s) != std::string::npos; }
+};
+
+static uint32_t now = 1000;
 
 struct Wire {
     std::deque<uint8_t> q;
@@ -40,6 +53,8 @@ struct FakePort : Port {
         return c;
     }
     int writable() override { return 1000; }
+    uint32_t us() override { return now * 1000; }
+    int available() override { return (int)in->q.size(); }
     void write(uint8_t b) override
     {
         if (out->count++ == out->corruptAt)
@@ -59,7 +74,6 @@ struct FakePort : Port {
     }
 };
 
-static uint32_t now = 1000;
 
 static bool runUntil(Link &a, Link *b, State want, uint32_t maxMs)
 {
@@ -422,6 +436,67 @@ static void test_relink_after_fault_needs_no_new_block()
     TEST_ASSERT_FALSE(block);
 }
 
+static void test_result_and_log_lines_of_a_block()
+{
+    Wire w;
+    FakePort p(&w, &w);
+    Lines log;
+    Link a(p, 1234);
+    a.setLogger(&log);
+    a.start(now);
+    TEST_ASSERT_TRUE(runUntil(a, nullptr, LINKED, 10000));
+    const Result &r = a.result();
+    TEST_ASSERT_EQUAL_UINT32(1, r.seq);
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_EQUAL_UINT32(BLOCK_BYTES, r.bytes);
+    TEST_ASSERT_GREATER_THAN_UINT32(0, r.bytesPerSec);
+    TEST_ASSERT_TRUE(log.has("link open"));
+    TEST_ASSERT_TRUE(log.has("peer detected"));
+    TEST_ASSERT_TRUE(log.has("block start GEN 512k 115200 baud"));
+    TEST_ASSERT_TRUE(log.has("block ok GEN 512k"));
+}
+
+static void test_failure_gives_result_with_reason_and_log_line()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Lines log;
+    Link a(pa, 33), b(pb, 44);
+    a.setLogger(&log);
+    startBoth(a, b);
+    for (uint32_t i = 0; i < 5000 && a.state() != GEN && b.state() != GEN; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    Wire &toAcceptor = (a.state() == GEN) ? ab : ba;
+    toAcceptor.corruptAt = toAcceptor.count + 1000;
+    for (uint32_t i = 0; i < 3000 && !a.failures; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    TEST_ASSERT_FALSE(a.result().ok);
+    TEST_ASSERT_GREATER_THAN_UINT32(0, strlen(a.result().reason));
+    TEST_ASSERT_TRUE(log.has("FAIL "));
+}
+
+static void test_single_byte_window_measures_round_trips()
+{
+    Wire w;
+    FakePort p(&w, &w);
+    Link a(p, 4321);
+    a.start(now);
+    TEST_ASSERT_TRUE(runUntil(a, nullptr, LINKED, 10000));
+    Run r;
+    r.kib = 1;
+    r.window = 1;
+    TEST_ASSERT_TRUE(a.startRun(r, now));
+    for (uint32_t i = 0; i < 20000 && a.result().seq < 2; i++, now++)
+        a.poll(now);
+    TEST_ASSERT_EQUAL_UINT32(2, a.result().seq);
+    TEST_ASSERT_EQUAL_UINT32(1024, a.result().rtt.n);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1000, a.result().rtt.min);
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -446,6 +521,9 @@ void setup()
     RUN_TEST(test_acceptor_grants_at_most_its_ceiling);
     RUN_TEST(test_peer_that_never_switches_fails_and_both_return_to_base);
     RUN_TEST(test_relink_after_fault_needs_no_new_block);
+    RUN_TEST(test_result_and_log_lines_of_a_block);
+    RUN_TEST(test_failure_gives_result_with_reason_and_log_line);
+    RUN_TEST(test_single_byte_window_measures_round_trips);
     exit(UNITY_END());
 }
 
