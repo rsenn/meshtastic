@@ -1239,9 +1239,15 @@ void setup()
     // Start airtime logger thread.
     airTime = new AirTime();
 
-    if (!rIf)
+    if (!rIf) {
+#ifdef OTP_APP
+        // the OTP serial test runs with the LoRa cap off; a recorded fault puts the fault frame first and pulls the display
+        // back to it whenever the frames are rebuilt
+        LOG_WARN("No radio, not recording a critical fault in an OTP build");
+#else
         RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_NO_RADIO);
-    else {
+#endif
+    } else {
 #ifndef ARCH_PORTDUINO_WASM
         // Log bit rate to debug output
         LOG_DEBUG("LoRA bitrate = %f bytes / sec", (float(meshtastic_Constants_DATA_PAYLOAD_LEN) /
