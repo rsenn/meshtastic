@@ -4,6 +4,8 @@
 #include "modules/optional/Otp/OtpSuite.h"
 #include <string.h>
 #include <deque>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string>
 #include <unity.h>
 
@@ -28,6 +30,8 @@ static uint32_t now = 1000;
 struct Wire {
     std::deque<uint8_t> q;
     std::deque<uint32_t> bq; // speed the writer was at, one per byte written through a port
+    std::deque<uint64_t> rq; // microsecond at which the byte has crossed the wire, one per byte written through a port
+    uint64_t freeAtUs = 0;   // wire busy until
     bool cut = false;        // drop everything written
     int corruptAt = -1;      // flip the byte with this running index
     int count = 0;
@@ -43,6 +47,12 @@ struct FakePort : Port {
     {
         if (in->q.empty())
             return -1;
+
+        // a byte is readable only once it has crossed the wire: 10 bits at the writer's speed
+        if (!in->rq.empty() && in->rq.front() > (uint64_t)now * 1000)
+            return -1;
+        if (!in->rq.empty())
+            in->rq.pop_front();
         int c = in->q.front();
         in->q.pop_front();
         if (!in->bq.empty()) {
@@ -63,6 +73,10 @@ struct FakePort : Port {
         if (!out->cut) {
             out->q.push_back(b);
             out->bq.push_back(baud);
+            if (out->freeAtUs < (uint64_t)now * 1000)
+                out->freeAtUs = (uint64_t)now * 1000;
+            out->freeAtUs += 10000000ull / baud;
+            out->rq.push_back(out->freeAtUs);
         }
     }
     void setBaud(uint32_t b) override
@@ -160,8 +174,8 @@ static void test_cut_wire_in_transfer_times_out_both()
         a.poll(now);
         b.poll(now);
     }
-    TEST_ASSERT_EQUAL(SLEEP, a.state());
-    TEST_ASSERT_EQUAL(SLEEP, b.state());
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1, a.failures);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1, b.failures);
     ab.cut = ba.cut = false;
     TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
 }
@@ -178,7 +192,7 @@ static void test_missed_heartbeat_when_linked_resets_both()
         b.poll(now);
     }
     ba.cut = true; // b goes mute
-    for (uint32_t i = 0; i < 400; i++, now++) {
+    for (uint32_t i = 0; i < 1200; i++, now++) {
         a.poll(now);
         b.poll(now);
     }
@@ -592,7 +606,7 @@ static void test_tuning_group_reports_every_window()
     }
     for (int g = 0; g < 3; g++) // speed, faults, tuning
         runGroup(s, a, &b, 800000);
-    TEST_ASSERT_TRUE(log.has("suite tuning done 8 ok 0 failed 0 skipped"));
+    TEST_ASSERT_TRUE(log.has("suite tuning done 5 ok 0 failed 0 skipped"));
     TEST_ASSERT_TRUE(log.has("rtt 1024 round trips"));
     TEST_ASSERT_TRUE(log.has("window 1024"));
 }
@@ -629,6 +643,69 @@ static void test_suite_waits_for_slow_blocks()
     TEST_ASSERT_TRUE(log.has("suite speed done 8 ok 0 failed 0 skipped"));
 }
 
+// heartbeat spacing was +-50% of 200 ms; the hardware loop broke it, the window is now 40..1000 ms
+static void test_heartbeat_gap_up_to_a_second_is_tolerated()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Link a(pa, 41), b(pb, 42);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
+    for (int i = 0; i < 1000; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    uint32_t failed = a.failures + b.failures;
+    ba.cut = true; // b is silent for 700 ms, then comes back
+    for (int i = 0; i < 700; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    ba.cut = false;
+    for (int i = 0; i < 1000; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    TEST_ASSERT_EQUAL_UINT32(failed, a.failures + b.failures);
+    TEST_ASSERT_EQUAL(LINKED, a.state());
+}
+
+// the whole run through speed, faults and tuning, polled every millisecond over a wire with real byte times, must take under 30 s
+static void test_all_groups_finish_in_under_30_seconds()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Lines log;
+    Link a(pa, 401), b(pb, 402);
+    a.setLogger(&log);
+    Suite s(a, &log);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
+    uint32_t total = 0;
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < 8000 && !s.press(now); i++, now++) {
+            a.poll(now);
+            b.poll(now);
+        }
+        TEST_ASSERT_TRUE(s.running());
+        uint32_t t0 = now;
+        for (uint32_t i = 0; i < 100000 && s.running(); i++, now++) {
+            a.poll(now);
+            b.poll(now);
+            s.poll(now);
+        }
+        TEST_ASSERT_FALSE(s.running());
+        total += now - t0;
+    }
+    if (getenv("OTP_VERBOSE"))
+        printf("%s", log.all.c_str());
+    char msg[64];
+    snprintf(msg, sizeof(msg), "all groups took %u ms", (unsigned)total);
+    TEST_MESSAGE(msg);
+    TEST_ASSERT_LESS_THAN_UINT32(30000, total);
+    TEST_ASSERT_EQUAL_UINT32(0, count(log.all, " FAIL"));
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -660,6 +737,8 @@ void setup()
     RUN_TEST(test_fault_suite_passes_in_loopback);
     RUN_TEST(test_tuning_group_reports_every_window);
     RUN_TEST(test_suite_waits_for_slow_blocks);
+    RUN_TEST(test_heartbeat_gap_up_to_a_second_is_tolerated);
+    RUN_TEST(test_all_groups_finish_in_under_30_seconds);
     exit(UNITY_END());
 }
 

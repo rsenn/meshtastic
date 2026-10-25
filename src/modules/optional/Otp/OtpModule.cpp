@@ -53,6 +53,34 @@ OtpModule::OtpModule() : MeshModule("Otp"), concurrency::OSThread("Otp"), link(u
     link.setLogger(&sink);
     if (inputBroker)
         inputObserver.observe(inputBroker);
+
+    // core 0 with WiFi and BLE, above the Arduino loop (priority 1), so the LCD flush on core 1 cannot delay it
+    xTaskCreatePinnedToCore(taskMain, "OtpLink", 8192 / sizeof(StackType_t), this, 5, nullptr, 0);
+}
+
+void OtpModule::taskMain(void *self)
+{
+    static_cast<OtpModule *>(self)->taskLoop();
+}
+
+// protocol side, every millisecond: link and suite do all the work while the UART is claimed
+void OtpModule::taskLoop()
+{
+    for (;;) {
+        {
+            concurrency::LockGuard guard(&lock);
+            if (open) {
+                uint32_t now = millis();
+                if (keySpace) {
+                    keySpace = false;
+                    suite.press(now);
+                }
+                link.poll(now);
+                suite.poll(now);
+            }
+        }
+        vTaskDelay(1);
+    }
 }
 
 int OtpModule::onInput(const InputEvent *event)
@@ -70,57 +98,49 @@ int32_t OtpModule::runOnce()
     uint32_t now = millis();
     bool visible = lastDraw != 0 && Throttle::isWithinTimespanMs(lastDraw, 1000);
 
-    if (!visible) {
-        if (open) {
+    // claim or release the UART with the link task held off
+    {
+        concurrency::LockGuard guard(&lock);
+        if (!visible && open) {
             Serial2.end();
             open = false;
             LOG_INFO("Otp: link closed");
+        } else if (visible && !open) {
+            // ring sizes must be set before begin(); the RX ring has to hold a whole window of unechoed bytes
+            Serial2.setRxBufferSize(OTP_RX_RING);
+            Serial2.setTxBufferSize(OTP_TX_RING);
+            Serial2.onReceiveError([this](hardwareSerial_error_t e) {
+                switch (e) {
+                case UART_FIFO_OVF_ERROR:
+                    uart.errs.fifo++;
+                    break;
+                case UART_BUFFER_FULL_ERROR:
+                    uart.errs.ring++;
+                    break;
+                case UART_FRAME_ERROR:
+                    uart.errs.frame++;
+                    break;
+                case UART_PARITY_ERROR:
+                    uart.errs.parity++;
+                    break;
+                case UART_BREAK_ERROR:
+                    uart.errs.brk++;
+                    break;
+                default:
+                    break;
+                }
+            });
+            Serial2.begin(OTP_BAUD, SERIAL_8N1, OTP_UART_RX, OTP_UART_TX);
+            link.start(now);
+            open = true;
+            LOG_INFO("Otp: link open, UART2 %d baud, TX %d RX %d, rings %d/%d", OTP_BAUD, OTP_UART_TX, OTP_UART_RX, OTP_RX_RING,
+                     OTP_TX_RING);
         }
+    }
+    if (!visible)
         return 200;
-    }
 
-    if (!open) {
-        // ring sizes must be set before begin(); the RX ring has to hold a whole window of unechoed bytes
-        Serial2.setRxBufferSize(OTP_RX_RING);
-        Serial2.setTxBufferSize(OTP_TX_RING);
-        Serial2.onReceiveError([this](hardwareSerial_error_t e) {
-            switch (e) {
-            case UART_FIFO_OVF_ERROR:
-                uart.errs.fifo++;
-                break;
-            case UART_BUFFER_FULL_ERROR:
-                uart.errs.ring++;
-                break;
-            case UART_FRAME_ERROR:
-                uart.errs.frame++;
-                break;
-            case UART_PARITY_ERROR:
-                uart.errs.parity++;
-                break;
-            case UART_BREAK_ERROR:
-                uart.errs.brk++;
-                break;
-            default:
-                break;
-            }
-        });
-        Serial2.begin(OTP_BAUD, SERIAL_8N1, OTP_UART_RX, OTP_UART_TX);
-        link.start(now);
-        open = true;
-        LOG_INFO("Otp: link open, UART2 %d baud, TX %d RX %d, rings %d/%d", OTP_BAUD, OTP_UART_TX, OTP_UART_RX, OTP_RX_RING,
-                 OTP_TX_RING);
-    }
-
-    if (keySpace) {
-        keySpace = false;
-        suite.press(now);
-    }
-
-    // protocol side: link and suite do all the work, polled as often as the scheduler allows
-    link.poll(now);
-    suite.poll(now);
-
-    // screen side: redraw on change, but only once a second while a quiet block runs, the LCD flush stalls this loop
+    // screen side: redraw on change, but only once a second while a quiet block runs, the LCD flush stalls this thread
     bool data = link.state() == otp::GEN || link.state() == otp::ACCEPT;
     bool quiet = data && !link.run().dump;
     uint32_t minGap = quiet ? 1000 : 100;
@@ -132,9 +152,7 @@ int32_t OtpModule::runOnce()
         e.action = UIFrameEvent::Action::REDRAW_ONLY;
         notifyObservers(&e);
     }
-
-    // data phases run back to back, otherwise 1 ms is plenty
-    return (data || link.state() == otp::SWITCH) ? 0 : 1;
+    return 20;
 }
 
 void OtpModule::drawHalf(OLEDDisplay *display, int16_t x, int16_t y, int rows, const char *name, const char *status,
@@ -160,6 +178,9 @@ void OtpModule::drawHalf(OLEDDisplay *display, int16_t x, int16_t y, int rows, c
 void OtpModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
     lastDraw = millis();
+
+    // the link task rewrites rows and state at any time; read them as one snapshot
+    concurrency::LockGuard guard(&lock);
     uint32_t now = lastDraw;
     display->setFont(FONT_SMALL);
     display->setColor(WHITE);

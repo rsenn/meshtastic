@@ -42,7 +42,7 @@ enum Fault : uint8_t {
     GLITCH,    // line speed drops to 9600 for 100 ms mid-block
     NO_SWITCH, // generator never changes speed after SPD
     STRAY,     // LINKED: one stray byte on the line
-    SKIP_HB    // LINKED: one heartbeat not sent
+    SKIP_HB    // LINKED: heartbeats stop for longer than the peer tolerates
 };
 
 // what one block transfer looks like, chosen by the generator and sent to the acceptor in SPD
@@ -53,7 +53,7 @@ struct Run {
     bool dump = false;          // hexdump rows, both ends, only sensible at 115200
     Source src = RANDOM;        // block content, generator only
     Fault fault = NO_FAULT;     // generator only, never sent to the peer
-    unsigned faultAt = 8192;    // block byte index where the fault hits
+    unsigned faultAt = 2048;    // block byte index where the fault hits
 };
 
 enum State : uint8_t {
@@ -87,8 +87,9 @@ class Link
     bool everReceived() const { return everRx; }
     uint32_t runMs(uint32_t now) const { return now - runStart; } // since the data phase began
     bool loopback() const { return loop_; } // the last handshake was with ourselves: speed faults cannot show
-    // idle for a second with the peer's heartbeat flowing: the peer has seen ours too, junk would not be ignored as boot noise
-    bool peerAlive(uint32_t now) const { return state_ == LINKED && hbValid && now - enteredAt >= 1000; }
+    // idle for 300 ms with the peer's heartbeat flowing: the peer has seen ours too, junk would not be ignored as boot noise
+    bool peerAlive(uint32_t now) const { return state_ == LINKED && hbValid && now - enteredAt >= 300; }
+    uint32_t maxHbGap() const { return maxHbGap_; } // longest peer heartbeat spacing since the last idle fault run began
     const Result &result() const { return result_; }
     void setLogger(Logger *l) { logger = l; }
     uint32_t revision() const { return rx.rev + tx.rev + failures; }
@@ -143,7 +144,9 @@ class Link
     uint32_t lastProgress = 0;           // last byte of the data phase
     bool everRx = false, hbValid = false;
     bool opened = false;                 // start() ran once
-    bool skipHb = false;                 // fault SKIP_HB armed
+    bool skipHb = false;                 // fault SKIP_HB armed: no heartbeats for a while
+    uint32_t skipAt = 0;                 // when it began
+    uint32_t maxHbGap_ = 0;              // longest peer heartbeat spacing seen, for the idle fault cases
     bool stalled = false;                // fault STALL fired
     bool glitching = false;              // fault GLITCH is running
     uint32_t glitchAt = 0;

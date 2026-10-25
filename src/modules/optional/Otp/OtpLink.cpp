@@ -218,7 +218,9 @@ bool Link::startRun(const Run &r, uint32_t now)
         return false;
     want = r;
 
-    // these two break the idle link instead of starting a block
+    // these two break the idle link instead of starting a block; the peer fails and returns within the heartbeat window, so
+    // the suite judges them by the longest heartbeat gap seen afterwards
+    maxHbGap_ = 0;
     if (r.fault == STRAY) {
         const uint8_t junk = 0x55;
         tx.put("fault: stray byte");
@@ -226,8 +228,9 @@ bool Link::startRun(const Run &r, uint32_t now)
         return true;
     }
     if (r.fault == SKIP_HB) {
-        tx.put("fault: skip a heartbeat");
+        tx.put("fault: skip heartbeats");
         skipHb = true;
+        skipAt = now;
         return true;
     }
 
@@ -329,9 +332,11 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
                 sendReq(now);
             }
         } else if (state_ == LINKED) {
-            // heartbeat must follow the fixed cycle within -50/+50%
+            // heartbeat spacing must stay inside HB_MIN_MS..HB_MAX_MS
             uint32_t dt = elapsed(now, lastHb);
-            if (hbValid && (dt < BEAT_MS / 2 || dt > BEAT_MS * 3 / 2))
+            if (hbValid && dt > maxHbGap_)
+                maxHbGap_ = dt;
+            if (hbValid && (dt < HB_MIN_MS || dt > HB_MAX_MS))
                 return fail(now, "HB after %ums", (unsigned)dt);
             lastHb = now;
             hbValid = true;
@@ -591,9 +596,10 @@ void Link::poll(uint32_t now)
     if ((state_ == BEAT || state_ == LINKED) && elapsed(now, lastBeat) >= BEAT_MS) {
         lastBeat = now;
         const uint8_t hb[2] = {SYNC, T_HB};
-        if (skipHb)
+        // fault SKIP_HB: silent for longer than the peer tolerates
+        if (skipHb && elapsed(now, skipAt) > HB_MAX_MS + BEAT_MS)
             skipHb = false;
-        else
+        if (!skipHb)
             send(hb, sizeof(hb), now);
     }
     int c;
@@ -612,7 +618,7 @@ void Link::poll(uint32_t now)
     } else if (state_ == NEGO && elapsed(now, negoAt) >= NEGO_MS) {
         fail(now, "no SPD");
     } else if (state_ == LINKED) {
-        uint32_t limit = hbValid ? BEAT_MS * 3 / 2 : BEAT_MS * 3;
+        uint32_t limit = hbValid ? HB_MAX_MS : HB_FIRST_MS;
         if (elapsed(now, hbValid ? lastHb : enteredAt) > limit)
             fail(now, "HB missed");
     }

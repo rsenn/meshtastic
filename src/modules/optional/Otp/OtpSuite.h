@@ -35,10 +35,11 @@ class Suite
         Run run;
         char expect[40]; // failure reason substrings separated by '|'; empty: the run must succeed
         bool needPeer;   // cannot fail in loopback (both ends are one UART), skipped there
+        unsigned observeMs; // idle fault: judge by the peer's heartbeat gap after this long, unless the link fails itself first
     };
 
     void plan(Group g);
-    void add(const char *name, const Run &r, const char *expect, bool needPeer = false);
+    void add(const char *name, const Run &r, const char *expect, bool needPeer = false, unsigned observeMs = 0);
     void judge(const Result &r, uint32_t now);
     void say(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     static bool matches(const char *reason, const char *expect);
@@ -52,7 +53,7 @@ class Suite
     Case cases[16];
     unsigned n = 0, idx = 0;
     unsigned seqAtStart = 0;
-    static constexpr uint32_t IDLE_TIMEOUT_MS = 8000; // idle link, no result
+    static constexpr uint32_t IDLE_TIMEOUT_MS = 4000; // idle link, no result
     uint32_t startedAt = 0, finishedAt = 0;
     unsigned okCount = 0, failCount = 0, skipCount = 0;
     uint32_t bestBaud = OTP_BAUD; // highest speed whose speed-group block passed

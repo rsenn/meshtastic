@@ -25,7 +25,7 @@ void Suite::say(const char *fmt, ...)
     log->line(s);
 }
 
-void Suite::add(const char *nm, const Run &r, const char *expect, bool needPeer)
+void Suite::add(const char *nm, const Run &r, const char *expect, bool needPeer, unsigned observeMs)
 {
     if (n >= sizeof(cases) / sizeof(cases[0]))
         return;
@@ -34,6 +34,7 @@ void Suite::add(const char *nm, const Run &r, const char *expect, bool needPeer)
     c.run = r;
     snprintf(c.expect, sizeof(c.expect), "%s", expect);
     c.needPeer = needPeer;
+    c.observeMs = observeMs;
 }
 
 void Suite::plan(Group g)
@@ -43,12 +44,12 @@ void Suite::plan(Group g)
     Run r;
 
     if (g == SPEED) {
-        // block size grows with the speed, about 1.3 s of wire time each; 115200 quiet is the baseline for the LCD cost
+        // block size grows with the speed, about half a second each (the whole run through all groups should take under 30 s); 115200 quiet is the baseline for the LCD cost
         // against the demo's hexdump
         static const struct {
             uint32_t baud;
             unsigned kib;
-        } steps[] = {{115200, 16}, {230400, 32}, {460800, 64}, {921600, 128}, {2000000, 256}, {3000000, 384}, {4000000, 512}, {5000000, 512}};
+        } steps[] = {{115200, 6}, {230400, 12}, {460800, 24}, {921600, 48}, {2000000, 100}, {3000000, 128}, {4000000, 128}, {5000000, 128}};
         for (auto &st : steps) {
             snprintf(nm, sizeof(nm), "%u", (unsigned)st.baud);
             r = Run();
@@ -59,7 +60,7 @@ void Suite::plan(Group g)
     } else if (g == FAULTS) {
         // fresh random block must pass, then every kind of bad data and bad link must be noticed
         r = Run();
-        r.kib = 16;
+        r.kib = 4;
         add("E0 random", r, "");
         static const struct {
             const char *nm;
@@ -67,7 +68,7 @@ void Suite::plan(Group g)
         } bad[] = {{"E1 text", TEXT}, {"E2 zeros", ZEROS}, {"E3 counter", COUNTER}, {"E4 repeat64", REPEAT64}, {"E5 biased", BIASED}};
         for (auto &e : bad) {
             r = Run();
-            r.kib = 16;
+            r.kib = 4;
             r.src = e.src;
             // two devices: the acceptor trips first and goes silent, so the generator sees a stall; its log has the real reason
             add(e.nm, r, "low entropy|stall");
@@ -86,20 +87,21 @@ void Suite::plan(Group g)
         };
         for (auto &e : broken) {
             r = Run();
-            r.kib = 16;
+            r.kib = 4;
             r.baud = e.baud;
             r.fault = e.f;
             // a speed fault shows only between two UARTs
             add(e.nm, r, e.expect, e.f == GLITCH || e.f == NO_SWITCH);
         }
 
-        // idle link faults: the peer drops out, so the generator sees its heartbeat vanish (a loopback sees its own junk)
+        // idle link faults: the peer fails and is back within the heartbeat window, so two devices see a gap in its heartbeat
+        // (judged after observeMs), a loopback sees its own junk or silence at once
         r = Run();
         r.kib = 1;
         r.fault = STRAY;
-        add("L5 stray", r, "HB missed|junk byte");
+        add("L5 stray", r, "junk byte|HB missed|peer silent", false, 1000);
         r.fault = SKIP_HB;
-        add("L6 skiphb", r, "HB missed|HB after");
+        add("L6 skiphb", r, "HB missed|HB after|peer silent", false, 1900);
     } else if (g == TUNING) {
         // round trips first (window 1), then the window sweep, all at the best clean speed of the speed group
         r = Run();
@@ -107,12 +109,12 @@ void Suite::plan(Group g)
         r.kib = 1;
         r.window = 1;
         add("rtt", r, "");
-        static const unsigned windows[] = {16, 32, 64, 128, 256, 512, 1024};
+        static const unsigned windows[] = {16, 64, 256, 1024};
         for (unsigned w : windows) {
             snprintf(nm, sizeof(nm), "win %u", w);
             r = Run();
             r.baud = bestBaud;
-            r.kib = 32;
+            r.kib = 8;
             r.window = w;
             add(nm, r, "");
         }
@@ -184,8 +186,8 @@ void Suite::poll(uint32_t now)
     }
 
     if (!waiting) {
-        // one second of settled heartbeat between cases, a failed case left both ends silent for 1..3 s
-        if (!link.peerAlive(now) || now - finishedAt < 1000)
+        // a short settle between cases; a failed case left both ends silent for 250..500 ms and peerAlive waits for the heartbeat
+        if (!link.peerAlive(now) || now - finishedAt < 150)
             return;
         Case &c = cases[idx];
         if (c.needPeer && link.loopback()) {
@@ -204,6 +206,15 @@ void Suite::poll(uint32_t now)
 
     if (link.result().seq != seqAtStart) {
         judge(link.result(), now);
+    } else if (cases[idx].observeMs && link.state() == LINKED && now - startedAt >= cases[idx].observeMs) {
+        // no failure of our own: did the peer go quiet for longer than a heartbeat cycle ever takes
+        Result seen;
+        seen.ok = false;
+        if (link.maxHbGap() >= 350)
+            snprintf(seen.reason, sizeof(seen.reason), "peer silent %u ms", (unsigned)link.maxHbGap());
+        else
+            snprintf(seen.reason, sizeof(seen.reason), "no peer gap (max %u ms)", (unsigned)link.maxHbGap());
+        judge(seen, now);
     } else if (link.state() == LINKED && now - startedAt > IDLE_TIMEOUT_MS) {
         // a block keeps the link out of LINKED until its own stall timeouts end it (hardware: 4 kB/s, not the wire speed),
         // so only an idle link that never produced a result is a hang: stray byte and skipped heartbeat cases, or a lost REQ
