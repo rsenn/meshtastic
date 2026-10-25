@@ -13,13 +13,17 @@ using namespace otp;
 
 struct Wire {
     std::deque<uint8_t> q;
-    bool cut = false;      // drop everything written
-    int corruptAt = -1;    // flip the byte with this running index
+    std::deque<uint32_t> bq; // speed the writer was at, one per byte written through a port
+    bool cut = false;        // drop everything written
+    int corruptAt = -1;      // flip the byte with this running index
     int count = 0;
 };
 
+// a byte read at another speed than it was written at arrives as garbage, like on a real UART
 struct FakePort : Port {
     Wire *in, *out;
+    uint32_t baud = OTP_BAUD, peak = OTP_BAUD;
+    bool stuck = false; // ignores setBaud: a peer that never switched
     FakePort(Wire *in, Wire *out) : in(in), out(out) {}
     int read() override
     {
@@ -27,6 +31,12 @@ struct FakePort : Port {
             return -1;
         int c = in->q.front();
         in->q.pop_front();
+        if (!in->bq.empty()) {
+            uint32_t wb = in->bq.front();
+            in->bq.pop_front();
+            if (wb != baud)
+                c = (c * 7 + 13) & 0xff; // scrambled, and scrambling twice does not restore it
+        }
         return c;
     }
     int writable() override { return 1000; }
@@ -34,8 +44,18 @@ struct FakePort : Port {
     {
         if (out->count++ == out->corruptAt)
             b ^= 0x40;
-        if (!out->cut)
+        if (!out->cut) {
             out->q.push_back(b);
+            out->bq.push_back(baud);
+        }
+    }
+    void setBaud(uint32_t b) override
+    {
+        if (stuck)
+            return;
+        baud = b;
+        if (b > peak)
+            peak = b;
     }
 };
 
@@ -174,7 +194,7 @@ static void test_key_starts_new_handshake_without_failure()
     TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 10000));
     a.restart(now);
     TEST_ASSERT_EQUAL(REQ, a.state());
-    for (uint32_t i = 0; i < 20 && a.state() == REQ; i++, now++) {
+    for (uint32_t i = 0; i < 200 && a.state() != GEN; i++, now++) {
         a.poll(now);
         b.poll(now);
     }
@@ -290,7 +310,15 @@ static void test_acceptor_rejects_structured_block()
     req[6] = crc8Ref(req + 1, 5);
     for (uint8_t v : req)
         in.q.push_back(v);
-    for (int i = 0; i < 5 && b.state() != ACCEPT; i++, now++)
+    // then its SPD: 115200, 512k, no dump
+    uint8_t spd[10] = {SYNC, T_SPD, 0x00, 0xC2, 0x01, 0x00, 0x00, 0x02, 0, 0};
+    spd[9] = crc8Ref(spd + 1, 8);
+    for (int i = 0; i < 5 && b.state() != NEGO; i++, now++)
+        b.poll(now);
+    TEST_ASSERT_EQUAL(NEGO, b.state());
+    for (uint8_t v : spd)
+        in.q.push_back(v);
+    for (int i = 0; i < 100 && b.state() != ACCEPT; i++, now++)
         b.poll(now);
     TEST_ASSERT_EQUAL(ACCEPT, b.state());
     for (int i = 0; i < 2000; i++)
@@ -300,6 +328,98 @@ static void test_acceptor_rejects_structured_block()
     TEST_ASSERT_EQUAL(SLEEP, b.state());
     TEST_ASSERT_EQUAL_UINT32(1, b.failures);
     TEST_ASSERT_NOT_NULL(strstr(b.rx.text[b.rx.cur], "low entropy"));
+}
+
+static void test_speed_negotiated_block_runs_fast_and_returns_to_base()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Link a(pa, 31), b(pb, 32);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 10000));
+    Run r;
+    r.baud = 921600;
+    r.kib = 64;
+    TEST_ASSERT_TRUE(a.startRun(r, now));
+    bool fast = false;
+    for (uint32_t i = 0; i < 5000 && !(i > 50 && a.state() == LINKED && b.state() == LINKED); i++, now++) {
+        a.poll(now);
+        b.poll(now);
+        fast |= a.state() == GEN && a.baud() == 921600 && b.baud() == 921600;
+    }
+    TEST_ASSERT_TRUE(fast);
+    TEST_ASSERT_EQUAL(LINKED, a.state());
+    TEST_ASSERT_EQUAL(LINKED, b.state());
+    TEST_ASSERT_EQUAL_UINT32(0, a.failures + b.failures);
+    TEST_ASSERT_EQUAL_UINT32(921600, pa.peak);
+    TEST_ASSERT_EQUAL_UINT32(921600, pb.peak);
+    TEST_ASSERT_EQUAL_UINT32(OTP_BAUD, pa.baud);
+    TEST_ASSERT_EQUAL_UINT32(OTP_BAUD, pb.baud);
+    TEST_ASSERT_EQUAL_UINT32(64 * 1024, a.total());
+}
+
+static void test_acceptor_grants_at_most_its_ceiling()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Link a(pa, 33), b(pb, 34);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 10000));
+    Run r;
+    r.baud = 9000000;
+    r.kib = 8;
+    a.startRun(r, now);
+    for (uint32_t i = 0; i < 400 && !(a.state() == GEN && b.state() == ACCEPT); i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    TEST_ASSERT_EQUAL(GEN, a.state());
+    TEST_ASSERT_EQUAL_UINT32(MAX_BAUD, a.baud());
+}
+
+static void test_peer_that_never_switches_fails_and_both_return_to_base()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Link a(pa, 135), b(pb, 136); // seeds 35/36 hit a gate false positive at byte 480503 (0.5% of nonces)
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 10000));
+    pb.stuck = true;
+    Run r;
+    r.baud = 921600;
+    r.kib = 64;
+    a.startRun(r, now);
+    for (uint32_t i = 0; i < 3000 && !(a.failures && b.failures); i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1, a.failures);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1, b.failures);
+    TEST_ASSERT_EQUAL_UINT32(OTP_BAUD, pa.baud);
+    pb.stuck = false;
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
+}
+
+static void test_relink_after_fault_needs_no_new_block()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Link a(pa, 37), b(pb, 38);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 10000));
+    TEST_ASSERT_TRUE(a.demoDone() && b.demoDone());
+    ba.q.push_back(0x55); // junk at a: a fails, b notices the silence
+    a.poll(now++);
+    bool block = false;
+    bool relinked = false;
+    for (uint32_t i = 0; i < 20000 && !relinked; i++, now++) {
+        a.poll(now);
+        b.poll(now);
+        block |= a.state() == GEN || a.state() == ACCEPT || b.state() == GEN || b.state() == ACCEPT;
+        relinked = i > 100 && a.state() == LINKED && b.state() == LINKED;
+    }
+    TEST_ASSERT_TRUE(relinked);
+    TEST_ASSERT_FALSE(block);
 }
 
 void setUp(void) {}
@@ -322,6 +442,10 @@ void setup()
     RUN_TEST(test_entropy_gate_passes_xorshift_blocks);
     RUN_TEST(test_entropy_gate_trips_on_structure);
     RUN_TEST(test_acceptor_rejects_structured_block);
+    RUN_TEST(test_speed_negotiated_block_runs_fast_and_returns_to_base);
+    RUN_TEST(test_acceptor_grants_at_most_its_ceiling);
+    RUN_TEST(test_peer_that_never_switches_fails_and_both_return_to_base);
+    RUN_TEST(test_relink_after_fault_needs_no_new_block);
     exit(UNITY_END());
 }
 

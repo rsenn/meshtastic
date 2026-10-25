@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 
+// wire format, states and timings: design-docs SERIAL_PROTOCOL.md
+// frame: [SYNC][type][payload][crc8 over type+payload], HB has no payload and no crc
+// block bytes after SPD are raw, no framing, the echo is the check
 namespace otp
 {
 static uint32_t elapsed(uint32_t now, uint32_t since)
@@ -12,6 +15,7 @@ static uint32_t elapsed(uint32_t now, uint32_t since)
     return now - since;
 }
 
+// poly 0x07, init 0, bitwise: frames are tiny and rare
 static uint8_t crc8(const uint8_t *p, size_t n)
 {
     uint8_t c = 0;
@@ -30,6 +34,11 @@ static uint8_t nextByte(uint32_t &x)
     x ^= x >> 17;
     x ^= x << 5;
     return (uint8_t)(x >> 8);
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+    return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
 void Rows::put(const char *fmt, ...)
@@ -53,6 +62,14 @@ uint32_t Link::random()
     return nextByte(rng) | (uint32_t)nextByte(rng) << 8 | (uint32_t)nextByte(rng) << 16 | (uint32_t)nextByte(rng) << 24;
 }
 
+void Link::setBaud(uint32_t baud)
+{
+    if (baud == curBaud)
+        return;
+    port.setBaud(baud);
+    curBaud = baud;
+}
+
 void Link::start(uint32_t now)
 {
     state_ = BEAT;
@@ -71,6 +88,8 @@ void Link::fail(uint32_t now, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     rx.put("FAIL %s", msg);
+
+    // stop talking at once; silence is what resyncs the peer (its own timeout fires within 600 ms)
     sleepAt = now;
     sleepFor = SLEEP_MIN_MS + random() % SLEEP_SPAN_MS;
     tx.put("silent %ums", (unsigned)sleepFor);
@@ -78,6 +97,9 @@ void Link::fail(uint32_t now, const char *fmt, ...)
     hbValid = false;
     pos = 0;
     failures++;
+
+    // always wake up at the base speed, the peer does the same after its own timeout
+    setBaud(OTP_BAUD);
 }
 
 bool Link::send(const uint8_t *p, size_t n, uint32_t now)
@@ -93,8 +115,36 @@ bool Link::send(const uint8_t *p, size_t n, uint32_t now)
 
 bool Link::sendNonce(uint8_t type, uint32_t nonce, uint32_t now)
 {
-    uint8_t f[7] = {SYNC, type, (uint8_t)nonce, (uint8_t)(nonce >> 8), (uint8_t)(nonce >> 16), (uint8_t)(nonce >> 24), 0};
+    // REQ and ACC share one layout
+    uint8_t f[7] = {
+        SYNC,
+        type,
+        (uint8_t)nonce,
+        (uint8_t)(nonce >> 8),
+        (uint8_t)(nonce >> 16),
+        (uint8_t)(nonce >> 24),
+        0, // crc8
+    };
     f[6] = crc8(f + 1, 5);
+    return send(f, sizeof(f), now);
+}
+
+bool Link::sendSpd(uint32_t baud, unsigned kib, bool dump, uint32_t now)
+{
+    // generator asks, acceptor answers with the same layout and the speed it grants
+    uint8_t f[10] = {
+        SYNC,
+        T_SPD,
+        (uint8_t)baud,
+        (uint8_t)(baud >> 8),
+        (uint8_t)(baud >> 16),
+        (uint8_t)(baud >> 24),
+        (uint8_t)kib,
+        (uint8_t)(kib >> 8),
+        (uint8_t)(dump ? 1 : 0), // flags: bit 0 hexdump
+        0,                       // crc8
+    };
+    f[9] = crc8(f + 1, 8);
     return send(f, sizeof(f), now);
 }
 
@@ -108,20 +158,31 @@ void Link::sendReq(uint32_t now)
     state_ = REQ;
 }
 
-void Link::restart(uint32_t now)
+bool Link::startRun(const Run &r, uint32_t now)
 {
-    if (state_ == LINKED) {
-        tx.put("key: new handshake");
-        sendReq(now);
-    }
+    if (state_ != LINKED)
+        return false;
+    want = r;
+    tx.put("key: new handshake");
+    sendReq(now);
+    return true;
 }
 
 void Link::bad(const char *what, uint32_t now)
 {
+    // before the handshake garbage is normal (boot noise, a peer mid-switch), after it any garbage is a fault
     if (state_ == BEAT)
         rx.put("ignored: %s", what);
     else
         fail(now, "%s", what);
+}
+
+// ACC and SPD are exchanged at 115200; the data phase starts after SWITCH at the granted speed
+void Link::beginSwitch(State next, uint32_t now)
+{
+    switchTo = next;
+    switchAt = now;
+    state_ = SWITCH;
 }
 
 void Link::beginData(State s, uint32_t now)
@@ -130,9 +191,45 @@ void Link::beginData(State s, uint32_t now)
     sentCnt = doneCnt = 0;
     txN = rxN = 0;
     lastProgress = lastLog = now;
+    blockBytes = run_.kib * 1024u;
+
+    // both ends derive the stream from the nonce of the REQ
     sendRng = checkRng = myNonce ? myNonce : 1;
     pos = 0;
     gate.reset();
+}
+
+// SPD arrives in NEGO only: acceptor gets the question, generator gets the answer
+void Link::onSpd(uint32_t now)
+{
+    uint32_t baud = le32(buf + 2);
+    unsigned kib = buf[6] | buf[7] << 8;
+    bool dump = buf[8] & 1;
+    if (baud == 0 || kib == 0)
+        return fail(now, "bad SPD");
+
+    if (gen) {
+        // answer: never faster than asked
+        if (baud > want.baud)
+            return fail(now, "SPD %u > %u", (unsigned)baud, (unsigned)want.baud);
+        rx.put("SPD %u ok", (unsigned)baud);
+        run_ = want;
+        run_.baud = baud;
+        tx.put("GEN %uk", kib);
+        return beginSwitch(GEN, now);
+    }
+
+    // question: grant the asked speed up to our ceiling, answer, wait until it has left the wire
+    uint32_t granted = baud < MAX_BAUD ? baud : MAX_BAUD;
+    rx.put("SPD %u %uk", (unsigned)baud, kib);
+    if (!sendSpd(granted, kib, dump, now))
+        return;
+    port.flush();
+    run_.baud = granted;
+    run_.kib = kib;
+    run_.dump = dump;
+    tx.put("ACC, echoing");
+    beginSwitch(ACCEPT, now);
 }
 
 void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
@@ -140,8 +237,19 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
     if (type == T_HB) {
         if (state_ == BEAT) {
             rx.put("HB: peer is there");
-            sendReq(now);
+            if (demoDone_) {
+                // link proven once already: heartbeat is enough, no block after a fault
+                state_ = LINKED;
+                lastHb = now;
+                hbValid = true;
+                enteredAt = now;
+            } else {
+                want = Run();
+                want.dump = true;
+                sendReq(now);
+            }
         } else if (state_ == LINKED) {
+            // heartbeat must follow the fixed cycle within -50/+50%
             uint32_t dt = elapsed(now, lastHb);
             if (hbValid && (dt < BEAT_MS / 2 || dt > BEAT_MS * 3 / 2))
                 return fail(now, "HB after %ums", (unsigned)dt);
@@ -154,30 +262,44 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
         }
     } else if (type == T_REQ) {
         if (state_ == REQ && nonce == myNonce) {
+            // our own REQ came back: loopback, we are generator and acceptor in one
             rx.put("own REQ back: loopback");
-            tx.put("GEN %uk", (unsigned)(BLOCK_BYTES / 1024));
-            beginData(GEN, now);
+            gen = true;
+            negoAt = now;
+            state_ = NEGO;
+            sendSpd(want.baud, want.kib, want.dump, now);
         } else if (state_ == BEAT || state_ == LINKED || (state_ == REQ && nonce > myNonce)) {
+            // peer generates; with two REQs in the air the higher nonce wins
             rx.put("REQ %08x", (unsigned)nonce);
             if (!sendNonce(T_ACC, nonce, now))
                 return;
-            tx.put("ACC, echoing");
             myNonce = nonce;
-            beginData(ACCEPT, now);
+            gen = false;
+            negoAt = now;
+            run_ = Run();
+            state_ = NEGO;
         } else {
             rx.put("REQ %08x lost tie", (unsigned)nonce);
         }
     } else if (type == T_ACC) {
         if (state_ == REQ && nonce == myNonce) {
             rx.put("ACC %08x", (unsigned)nonce);
-            tx.put("GEN %uk", (unsigned)(BLOCK_BYTES / 1024));
-            beginData(GEN, now);
+            gen = true;
+            negoAt = now;
+            state_ = NEGO;
+            sendSpd(want.baud, want.kib, want.dump, now);
         } else if (state_ != BEAT && state_ != REQ) {
             fail(now, "stray ACC");
         }
+    } else if (type == T_SPD) {
+        if (state_ == NEGO)
+            onSpd(now);
+        else if (state_ != BEAT && state_ != REQ)
+            fail(now, "stray SPD");
     }
 }
 
+// frame parser, one byte at a time: SYNC, type, then a fixed length per type
 void Link::onByte(uint8_t c, uint32_t now)
 {
     if (!active(now))
@@ -193,31 +315,36 @@ void Link::onByte(uint8_t c, uint32_t now)
         return;
     }
     buf[pos++] = c;
+
+    // length by type: HB 2, REQ and ACC 7, SPD 10
+    static const uint8_t lenOf[] = {0, 2, 7, 7, 10};
     if (pos == 2) {
+        if (c == 0 || c > T_SPD) {
+            pos = 0;
+            return bad("unknown frame", now);
+        }
         if (c == T_HB) {
             pos = 0;
             return onFrame(T_HB, 0, now);
         }
-        if (c != T_REQ && c != T_ACC) {
-            pos = 0;
-            return bad("unknown frame", now);
-        }
-    } else if (pos == 7) {
+    } else if (pos == lenOf[buf[1]]) {
         pos = 0;
-        if (crc8(buf + 1, 5) != buf[6])
+        if (crc8(buf + 1, lenOf[buf[1]] - 2) != buf[lenOf[buf[1]] - 1])
             return bad("frame crc", now);
-        uint32_t n = buf[2] | (uint32_t)buf[3] << 8 | (uint32_t)buf[4] << 16 | (uint32_t)buf[5] << 24;
-        onFrame(buf[1], n, now);
+        onFrame(buf[1], le32(buf + 2), now);
     }
 }
 
 void Link::hexLine(Rows &r, const char *tag, const uint8_t *ring, uint32_t n)
 {
+    // `178k |72 6f 6d 20 74 65|` the six newest bytes
     char hex[24] = "";
     uint32_t cnt = n < 6 ? n : 6;
     for (uint32_t i = 0; i < cnt; i++)
         snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02x ", ring[(n - cnt + i) % 6]);
-    r.put("%s %uk %s", tag, (unsigned)(n / 1024), hex);
+    if (cnt)
+        hex[cnt * 3 - 1] = '\0';
+    r.put("%s %uk |%s|", tag, (unsigned)(n / 1024), hex);
 }
 
 void Link::finish(uint32_t now)
@@ -227,12 +354,17 @@ void Link::finish(uint32_t now)
     state_ = LINKED;
     enteredAt = lastBeat = now;
     hbValid = false;
+    demoDone_ = true;
+
+    // last echo byte must be on the wire before the speed drops back
+    port.flush();
+    setBaud(OTP_BAUD);
 }
 
 void Link::pumpGen(uint32_t now)
 {
     int c;
-    for (int n = 0; n < 256 && doneCnt < BLOCK_BYTES && (c = port.read()) >= 0; n++) {
+    for (int n = 0; n < 256 && doneCnt < blockBytes && (c = port.read()) >= 0; n++) {
         everRx = true;
         lastRx = now;
         uint8_t want = nextByte(checkRng);
@@ -242,13 +374,16 @@ void Link::pumpGen(uint32_t now)
         // echo matches, but is the stream itself still random
         if (!gate.feed((uint8_t)c))
             return fail(now, "low entropy at %u", (unsigned)doneCnt);
+
         rxRing[rxN++ % 6] = (uint8_t)c;
         doneCnt++;
         lastProgress = now;
     }
-    if (doneCnt >= BLOCK_BYTES)
+    if (doneCnt >= blockBytes)
         return finish(now);
-    for (int n = 0; n < 256 && sentCnt < BLOCK_BYTES && sentCnt - doneCnt < WINDOW && port.writable() > 0; n++) {
+
+    // keep at most `window` bytes unechoed in flight, the UART buffers are small
+    for (int n = 0; n < 256 && sentCnt < blockBytes && sentCnt - doneCnt < run_.window && port.writable() > 0; n++) {
         uint8_t b = nextByte(sendRng);
         port.write(b);
         txRing[txN++ % 6] = b;
@@ -256,7 +391,7 @@ void Link::pumpGen(uint32_t now)
     }
     if (elapsed(now, lastProgress) >= STALL_MS)
         return fail(now, "stall at %u", (unsigned)doneCnt);
-    if (elapsed(now, lastLog) >= 250) {
+    if (run_.dump && elapsed(now, lastLog) >= 250) {
         lastLog = now;
         hexLine(tx, "TX", txRing, txN);
         hexLine(rx, "RX", rxRing, rxN);
@@ -278,12 +413,12 @@ void Link::pumpAccept(uint32_t now)
         rxRing[rxN++ % 6] = (uint8_t)c;
         doneCnt++;
         lastProgress = now;
-        if (doneCnt >= BLOCK_BYTES)
+        if (doneCnt >= blockBytes)
             return finish(now);
     }
     if (elapsed(now, lastProgress) >= STALL_MS)
         return fail(now, "stall at %u", (unsigned)doneCnt);
-    if (elapsed(now, lastLog) >= 250) {
+    if (run_.dump && elapsed(now, lastLog) >= 250) {
         lastLog = now;
         hexLine(rx, "RX", rxRing, rxN);
         hexLine(tx, "TX", rxRing, rxN);
@@ -303,6 +438,15 @@ void Link::poll(uint32_t now)
         if (elapsed(now, sleepAt) >= sleepFor)
             start(now);
         return;
+    case SWITCH:
+        // silent; the acceptor changes speed first, the generator a bit later, then both drop what the change left in RX
+        if (elapsed(now, switchAt) >= (gen ? SWITCH_GEN_MS : SWITCH_ACC_MS)) {
+            setBaud(run_.baud);
+            while (port.read() >= 0)
+                ;
+            beginData(switchTo, now);
+        }
+        return;
     case GEN:
         return pumpGen(now);
     case ACCEPT:
@@ -318,17 +462,19 @@ void Link::poll(uint32_t now)
     }
     int c;
     bool got = false;
-    for (int n = 0; n < 64 && (state_ == BEAT || state_ == REQ || state_ == LINKED) && (c = port.read()) >= 0; n++) {
+    for (int n = 0; n < 64 && framing() && (c = port.read()) >= 0; n++) {
         got = true;
         onByte((uint8_t)c, now);
     }
-    if (state_ != BEAT && state_ != REQ && state_ != LINKED)
+    if (!framing())
         return;
     if (!got && pos && elapsed(now, frameAt) > FRAME_MS) {
         pos = 0;
         bad("partial frame", now);
     } else if (state_ == REQ && elapsed(now, reqAt) >= REQ_MS) {
         fail(now, "no ACC");
+    } else if (state_ == NEGO && elapsed(now, negoAt) >= NEGO_MS) {
+        fail(now, "no SPD");
     } else if (state_ == LINKED) {
         uint32_t limit = hbValid ? BEAT_MS * 3 / 2 : BEAT_MS * 3;
         if (elapsed(now, hbValid ? lastHb : enteredAt) > limit)
