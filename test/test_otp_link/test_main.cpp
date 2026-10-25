@@ -706,6 +706,40 @@ static void test_all_groups_finish_in_under_30_seconds()
     TEST_ASSERT_EQUAL_UINT32(0, count(log.all, " FAIL"));
 }
 
+// a Cardputer with G13 jumpered to G15: one UART talks to itself. Every group must run to the end, the two speed faults that a
+// single UART cannot show are skipped, nothing else may fail, and the whole run stays under 30 s
+static void test_all_groups_run_to_completion_in_loopback()
+{
+    Wire w;
+    FakePort p(&w, &w);
+    Lines log;
+    Link a(p, 501);
+    a.setLogger(&log);
+    Suite s(a, &log);
+    a.start(now);
+    TEST_ASSERT_TRUE(runUntil(a, nullptr, LINKED, 20000));
+    uint32_t total = 0;
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < 8000 && !s.press(now); i++, now++)
+            a.poll(now);
+        TEST_ASSERT_TRUE(s.running());
+        uint32_t t0 = now;
+        for (uint32_t i = 0; i < 100000 && s.running(); i++, now++) {
+            a.poll(now);
+            s.poll(now);
+        }
+        TEST_ASSERT_FALSE(s.running());
+        total += now - t0;
+    }
+    if (getenv("OTP_VERBOSE"))
+        printf("%s", log.all.c_str());
+    TEST_ASSERT_TRUE(log.has("suite speed done 8 ok 0 failed 0 skipped"));
+    TEST_ASSERT_TRUE(log.has("suite faults done 11 ok 0 failed 2 skipped"));
+    TEST_ASSERT_TRUE(log.has("suite tuning done 5 ok 0 failed 0 skipped"));
+    TEST_ASSERT_EQUAL_UINT32(0, count(log.all, "case ") - count(log.all, " PASS") - count(log.all, "skipped: loopback"));
+    TEST_ASSERT_LESS_THAN_UINT32(30000, total);
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -739,6 +773,7 @@ void setup()
     RUN_TEST(test_suite_waits_for_slow_blocks);
     RUN_TEST(test_heartbeat_gap_up_to_a_second_is_tolerated);
     RUN_TEST(test_all_groups_finish_in_under_30_seconds);
+    RUN_TEST(test_all_groups_run_to_completion_in_loopback);
     exit(UNITY_END());
 }
 
