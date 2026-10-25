@@ -21,7 +21,8 @@ class Suite
     void poll(uint32_t now);
 
     bool running() const { return running_; }
-    Group next() const { return next_; }
+    Group next() const { return next_; } // what the next press starts
+    Group group() const { return group_; }
     static const char *name(Group g);
     unsigned step() const { return idx; }  // cases finished in the running group
     unsigned steps() const { return n; }   // cases in the running group
@@ -45,7 +46,7 @@ class Suite
     Link &link;
     Logger *log;
     Group next_ = SPEED;   // what the next press starts
-    Group group = NONE;    // running group
+    Group group_ = NONE;   // running group
     bool running_ = false;
     bool waiting = false;  // a case was handed to the link and its result is not in
     Case cases[16];

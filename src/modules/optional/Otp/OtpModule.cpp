@@ -22,8 +22,35 @@ void OtpModule::Uart::write(uint8_t b)
     Serial2.write(b);
 }
 
-OtpModule::OtpModule() : MeshModule("Otp"), concurrency::OSThread("Otp"), link(uart, esp_random())
+void OtpModule::Uart::setBaud(uint32_t baud)
 {
+    Serial2.updateBaudRate(baud);
+}
+
+void OtpModule::Uart::flush()
+{
+    // returns when the TX FIFO is empty, not only the ring
+    Serial2.flush();
+}
+
+int OtpModule::Uart::available()
+{
+    return Serial2.available();
+}
+
+uint32_t OtpModule::Uart::us()
+{
+    return micros();
+}
+
+void OtpModule::Sink::line(const char *s)
+{
+    LOG_INFO("Otp: %s", s);
+}
+
+OtpModule::OtpModule() : MeshModule("Otp"), concurrency::OSThread("Otp"), link(uart, esp_random()), suite(link, &sink)
+{
+    link.setLogger(&sink);
     if (inputBroker)
         inputObserver.observe(inputBroker);
 }
@@ -32,13 +59,9 @@ int OtpModule::onInput(const InputEvent *event)
 {
     if (!open)
         return 0;
-    // 'x' injects a stray byte, 'b' drops the baud rate for a moment; any other key starts a new handshake
-    if (event->kbchar == 'x')
-        keyJunk = true;
-    else if (event->kbchar == 'b')
-        keyGlitch = true;
-    else
-        keyRestart = true;
+    // space is the only key: next test group once the link is idle
+    if (event->kbchar == ' ')
+        keySpace = true;
     return 0;
 }
 
@@ -55,57 +78,83 @@ int32_t OtpModule::runOnce()
         }
         return 200;
     }
+
     if (!open) {
-        Serial2.setRxBufferSize(1024);
+        // ring sizes must be set before begin(); the RX ring has to hold a whole window of unechoed bytes
+        Serial2.setRxBufferSize(OTP_RX_RING);
+        Serial2.setTxBufferSize(OTP_TX_RING);
+        Serial2.onReceiveError([this](hardwareSerial_error_t e) {
+            switch (e) {
+            case UART_FIFO_OVF_ERROR:
+                uart.errs.fifo++;
+                break;
+            case UART_BUFFER_FULL_ERROR:
+                uart.errs.ring++;
+                break;
+            case UART_FRAME_ERROR:
+                uart.errs.frame++;
+                break;
+            case UART_PARITY_ERROR:
+                uart.errs.parity++;
+                break;
+            case UART_BREAK_ERROR:
+                uart.errs.brk++;
+                break;
+            default:
+                break;
+            }
+        });
         Serial2.begin(OTP_BAUD, SERIAL_8N1, OTP_UART_RX, OTP_UART_TX);
         link.start(now);
         open = true;
-        LOG_INFO("Otp: link open, UART2 %d baud, TX %d RX %d", OTP_BAUD, OTP_UART_TX, OTP_UART_RX);
+        LOG_INFO("Otp: link open, UART2 %d baud, TX %d RX %d, rings %d/%d", OTP_BAUD, OTP_UART_TX, OTP_UART_RX, OTP_RX_RING,
+                 OTP_TX_RING);
     }
 
-    if (keyRestart) {
-        keyRestart = false;
-        link.restart(now);
-    }
-    if (keyJunk) {
-        keyJunk = false;
-        Serial2.write(0x55);
-    }
-    if (keyGlitch) {
-        keyGlitch = false;
-        Serial2.updateBaudRate(9600);
-        glitching = true;
-        glitchAt = now;
-    }
-    if (glitching && Throttle::hasElapsed(glitchAt, 100)) {
-        Serial2.updateBaudRate(OTP_BAUD);
-        glitching = false;
+    if (keySpace) {
+        keySpace = false;
+        suite.press(now);
     }
 
+    // protocol side: link and suite do all the work, polled as often as the scheduler allows
     link.poll(now);
+    suite.poll(now);
 
+    // screen side: redraw on change, but only once a second while a quiet block runs, the LCD flush stalls this loop
+    bool data = link.state() == otp::GEN || link.state() == otp::ACCEPT;
+    bool quiet = data && !link.run().dump;
+    uint32_t minGap = quiet ? 1000 : 100;
     uint32_t rev = link.revision();
-    if ((rev != lastRev && Throttle::hasElapsed(lastRedraw, 100)) || Throttle::hasElapsed(lastRedraw, otp::BEAT_MS)) {
+    if ((rev != lastRev && Throttle::hasElapsed(lastRedraw, minGap)) || Throttle::hasElapsed(lastRedraw, quiet ? 1000 : otp::BEAT_MS)) {
         lastRev = rev;
         lastRedraw = now;
         UIFrameEvent e;
         e.action = UIFrameEvent::Action::REDRAW_ONLY;
         notifyObservers(&e);
     }
-    return 1;
+
+    // data phases run back to back, otherwise 1 ms is plenty
+    return (data || link.state() == otp::SWITCH) ? 0 : 1;
 }
 
 void OtpModule::drawHalf(OLEDDisplay *display, int16_t x, int16_t y, int rows, const char *name, const char *status,
-                         const otp::Rows &r)
+                         const char *tag, const char *const *lines)
 {
     char head[32];
     snprintf(head, sizeof(head), "%s  %s", name, status);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
     display->drawString(x + 1, y, head);
-    int lh = FONT_HEIGHT_SMALL;
-    for (int i = 0; i < rows; i++) {
-        int idx = (r.cur + 1 + otp::Rows::N - rows + i) % otp::Rows::N;
-        display->drawString(x + 1, y + lh * (i + 1), r.text[idx]);
+
+    // run mode tag at the right edge of the header
+    if (tag[0]) {
+        display->setTextAlignment(TEXT_ALIGN_RIGHT);
+        display->drawString(x + display->getWidth(), y, tag);
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
     }
+
+    int lh = FONT_HEIGHT_SMALL;
+    for (int i = 0; i < rows; i++)
+        display->drawString(x + 1, y + lh * (i + 1), lines[i]);
 }
 
 void OtpModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
@@ -113,7 +162,6 @@ void OtpModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
     lastDraw = millis();
     uint32_t now = lastDraw;
     display->setFont(FONT_SMALL);
-    display->setTextAlignment(TEXT_ALIGN_LEFT);
     display->setColor(WHITE);
 
     int half = display->getHeight() / 2;
@@ -122,35 +170,101 @@ void OtpModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
         rows = otp::Rows::N;
 
     otp::State s = link.state();
-    const char *rxStatus = s == otp::LINKED ? "connected" : link.active(now) ? "Activity!" : "NC";
+    bool data = s == otp::GEN || s == otp::ACCEPT;
+    bool dump = link.run().dump;
+    unsigned pct = link.total() ? (unsigned)((uint64_t)link.done() * 100 / link.total()) : 0;
+
+    // headers: RX says what the line does, TX what we do
+    char rxStatus[24];
+    if (s == otp::LINKED)
+        snprintf(rxStatus, sizeof(rxStatus), "connected");
+    else if (data)
+        snprintf(rxStatus, sizeof(rxStatus), "%s %u%%", s == otp::GEN ? "generator" : "acceptor", pct);
+    else
+        snprintf(rxStatus, sizeof(rxStatus), "%s", link.active(now) ? "Activity!" : "NC");
 
     char txStatus[24];
     static const char spin[] = "-\\|/";
     char beat = spin[(now / otp::BEAT_MS) % 4];
     switch (s) {
     case otp::BEAT:
+    case otp::LINKED:
         snprintf(txStatus, sizeof(txStatus), "beat %c", beat);
         break;
     case otp::REQ:
         snprintf(txStatus, sizeof(txStatus), "asking %c", beat);
         break;
+    case otp::NEGO:
+    case otp::SWITCH:
+        snprintf(txStatus, sizeof(txStatus), "speed %c", beat);
+        break;
     case otp::GEN:
-        snprintf(txStatus, sizeof(txStatus), "generator %u%%", (unsigned)((uint64_t)link.done() * 100 / link.total()));
+        snprintf(txStatus, sizeof(txStatus), "generator %u%%", pct);
         break;
     case otp::ACCEPT:
-        snprintf(txStatus, sizeof(txStatus), "acceptor %u%%", (unsigned)((uint64_t)link.done() * 100 / link.total()));
-        break;
-    case otp::LINKED:
-        snprintf(txStatus, sizeof(txStatus), "beat %c", beat);
+        snprintf(txStatus, sizeof(txStatus), "acceptor %u%%", pct);
         break;
     default:
         snprintf(txStatus, sizeof(txStatus), "silent");
         break;
     }
 
-    drawHalf(display, x, y, rows, "RX", rxStatus, link.rx);
+    // run mode tag: "115k dump", "2M quiet"
+    char tag[16];
+    uint32_t baud = link.run().baud;
+    if (baud >= 1000000)
+        snprintf(tag, sizeof(tag), "%uM %s", (unsigned)(baud / 1000000), dump ? "dump" : "quiet");
+    else
+        snprintf(tag, sizeof(tag), "%uk %s", (unsigned)(baud / 1000), dump ? "dump" : "quiet");
+
+    // rows: wiring help until the first byte, progress numbers in quiet blocks, else the link's own log rows
+    char rxBuf[otp::Rows::N][otp::Rows::W] = {};
+    char txBuf[otp::Rows::N][otp::Rows::W] = {};
+    const char *rxLine[otp::Rows::N];
+    const char *txLine[otp::Rows::N];
+    for (int i = 0; i < rows; i++) {
+        int idx = (link.rx.cur + 1 + otp::Rows::N - rows + i) % otp::Rows::N;
+        rxLine[i] = link.rx.text[idx];
+        idx = (link.tx.cur + 1 + otp::Rows::N - rows + i) % otp::Rows::N;
+        txLine[i] = link.tx.text[idx];
+    }
+
+    if (!link.everReceived()) {
+        // wiring help; a correct link reacts within ~200 ms, so silence after wiring means the wiring is wrong
+        snprintf(rxBuf[0], otp::Rows::W, "%s", OTP_PIN_HINT1);
+        snprintf(rxBuf[1], otp::Rows::W, "%s", OTP_PIN_HINT2);
+        snprintf(txBuf[0], otp::Rows::W, "%s", OTP_WIRED_HINT1);
+        snprintf(txBuf[1], otp::Rows::W, "%s", OTP_WIRED_HINT2);
+        for (int i = 0; i < rows; i++) {
+            rxLine[i] = rxBuf[i];
+            txLine[i] = txBuf[i];
+        }
+    } else {
+        if (data && !dump) {
+            uint32_t ms = link.runMs(now);
+            snprintf(rxBuf[0], otp::Rows::W, "%uk of %uk  %u kB/s", (unsigned)(link.done() / 1024), (unsigned)(link.total() / 1024),
+                     ms ? (unsigned)((uint64_t)link.done() / ms) : 0);
+            snprintf(rxBuf[1], otp::Rows::W, "%u baud", (unsigned)link.baud());
+            for (int i = 0; i < rows; i++)
+                rxLine[i] = rxBuf[i];
+        }
+
+        // idle or testing: TX half names what space does next and the newest case outcome
+        if (s == otp::LINKED || suite.running()) {
+            if (suite.running())
+                snprintf(txBuf[0], otp::Rows::W, "%s %u/%u %s", otp::Suite::name(suite.group()), suite.step() + 1, suite.steps(),
+                         suite.current());
+            else
+                snprintf(txBuf[0], otp::Rows::W, "space: %s test", otp::Suite::name(suite.next()));
+            snprintf(txBuf[1], otp::Rows::W, "%s", suite.last());
+            for (int i = 0; i < rows; i++)
+                txLine[i] = txBuf[i];
+        }
+    }
+
+    drawHalf(display, x, y, rows, "RX", rxStatus, "", rxLine);
     display->drawLine(x, y + half, x + display->getWidth(), y + half);
-    drawHalf(display, x, y + half + 1, rows, "TX", txStatus, link.tx);
+    drawHalf(display, x, y + half + 1, rows, "TX", txStatus, tag, txLine);
 }
 
 #endif

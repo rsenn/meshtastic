@@ -11,6 +11,19 @@
 #endif
 
 #define OTP_BAUD 115200
+#define OTP_RX_RING 2048 // driver RX ring, must hold the largest window of the tuning sweep (1024) plus a slow loop turn
+#define OTP_TX_RING 1024
+
+// shown while nothing was ever received (RX half), and what to do when wired but silent (TX half)
+#if defined(M5STACK_CARDPUTER_ADV)
+#define OTP_PIN_HINT1 "cap off: G13=TX  G15=RX"
+#define OTP_PIN_HINT2 "cross TX-RX, join GND"
+#elif defined(T_LORA_PAGER)
+#define OTP_PIN_HINT1 "12-pin header: TX = G43   RX = G44"
+#define OTP_PIN_HINT2 "cross TX to RX, join GND"
+#endif
+#define OTP_WIRED_HINT1 "wired, no Activity! in 1 s:"
+#define OTP_WIRED_HINT2 "unplug, recheck wiring"
 
 namespace otp
 {

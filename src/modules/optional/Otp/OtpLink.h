@@ -84,6 +84,8 @@ class Link
     const Run &run() const { return run_; }
     uint32_t baud() const { return curBaud; }
     bool demoDone() const { return demoDone_; }
+    bool everReceived() const { return everRx; }
+    uint32_t runMs(uint32_t now) const { return now - runStart; } // since the data phase began
     bool loopback() const { return loop_; } // the last handshake was with ourselves: speed faults cannot show
     // idle for a second with the peer's heartbeat flowing: the peer has seen ours too, junk would not be ignored as boot noise
     bool peerAlive(uint32_t now) const { return state_ == LINKED && hbValid && now - enteredAt >= 1000; }

@@ -123,14 +123,14 @@ bool Suite::press(uint32_t now)
 {
     if (running_ || !link.demoDone() || !link.peerAlive(now))
         return false;
-    group = next_;
-    next_ = group == SPEED ? FAULTS : group == FAULTS ? TUNING : SPEED;
-    plan(group);
+    group_ = next_;
+    next_ = group_ == SPEED ? FAULTS : group_ == FAULTS ? TUNING : SPEED;
+    plan(group_);
     running_ = true;
     waiting = false;
     okCount = failCount = skipCount = 0;
     finishedAt = now;
-    say("suite %s start, %u cases", name(group), n);
+    say("suite %s start, %u cases", name(group_), n);
     return true;
 }
 
@@ -158,7 +158,7 @@ void Suite::judge(const Result &r, uint32_t now)
             snprintf(got, sizeof(got), "%s", r.reason);
 
         // the speed group remembers how fast it went
-        if (pass && group == SPEED && r.baud > bestBaud)
+        if (pass && group_ == SPEED && r.baud > bestBaud)
             bestBaud = r.baud;
     } else {
         pass = !r.ok && matches(r.reason, c.expect);
@@ -178,7 +178,7 @@ void Suite::poll(uint32_t now)
         return;
 
     if (idx >= n) {
-        say("suite %s done %u ok %u failed %u skipped", name(group), okCount, failCount, skipCount);
+        say("suite %s done %u ok %u failed %u skipped", name(group_), okCount, failCount, skipCount);
         running_ = false;
         return;
     }
