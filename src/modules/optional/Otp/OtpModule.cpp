@@ -96,7 +96,10 @@ int OtpModule::onInput(const InputEvent *event)
 int32_t OtpModule::runOnce()
 {
     uint32_t now = millis();
-    bool visible = lastDraw != 0 && Throttle::isWithinTimespanMs(lastDraw, 1000);
+    // The frame counts as shown for 4 s after its last draw (quiet blocks redraw once a second), and a run in progress is never
+    // closed under its feet: the first hardware run with quiet blocks closed the link a second into every block.
+    bool busy = suite.running() || (link.state() != otp::LINKED && link.state() != otp::BEAT && link.state() != otp::SLEEP);
+    bool visible = busy || (lastDraw != 0 && Throttle::isWithinTimespanMs(lastDraw, 4000));
 
     // claim or release the UART with the link task held off
     {

@@ -740,6 +740,29 @@ static void test_all_groups_run_to_completion_in_loopback()
     TEST_ASSERT_LESS_THAN_UINT32(30000, total);
 }
 
+// hardware log: the module closes the UART mid-block and reopens it at 115200 with link.start(); the link must not keep believing
+// in the speed it had ("peer detected ... 230400 baud")
+static void test_start_after_reopen_forgets_the_old_speed()
+{
+    Wire ab, ba;
+    FakePort pa(&ba, &ab), pb(&ab, &ba);
+    Link a(pa, 61), b(pb, 62);
+    startBoth(a, b);
+    TEST_ASSERT_TRUE(runUntil(a, &b, LINKED, 20000));
+    Run r;
+    r.baud = 921600;
+    r.kib = 64;
+    TEST_ASSERT_TRUE(a.startRun(r, now));
+    for (uint32_t i = 0; i < 2000 && !(a.state() == GEN && a.baud() == 921600); i++, now++) {
+        a.poll(now);
+        b.poll(now);
+    }
+    TEST_ASSERT_EQUAL_UINT32(921600, a.baud());
+    a.start(now); // UART closed and reopened at the base speed
+    TEST_ASSERT_EQUAL_UINT32(OTP_BAUD, a.baud());
+    TEST_ASSERT_EQUAL(BEAT, a.state());
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
@@ -774,6 +797,7 @@ void setup()
     RUN_TEST(test_heartbeat_gap_up_to_a_second_is_tolerated);
     RUN_TEST(test_all_groups_finish_in_under_30_seconds);
     RUN_TEST(test_all_groups_run_to_completion_in_loopback);
+    RUN_TEST(test_start_after_reopen_forgets_the_old_speed);
     exit(UNITY_END());
 }
 

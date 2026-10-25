@@ -162,6 +162,7 @@ class Link
     Errs errsAtStart;                    // UART errors when the data phase began
     uint32_t runStart = 0;               // data phase began, ms
     uint32_t lastPollUs = 0, gapUs = 0;  // loop gap tracking during the data phase
+    uint32_t prevPollUs = 0, hbGapUs = 0; // poll spacing since the last peer heartbeat
     uint32_t sendUs = 0;                 // when the single byte in flight left (window 1)
     unsigned ringHigh = 0;               // RX ring fill high water of the run
     uint32_t linkOpenAt = 0;             // first start(), for the peer detected message

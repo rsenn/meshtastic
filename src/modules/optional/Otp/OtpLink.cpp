@@ -111,6 +111,10 @@ void Link::sampleLoop()
 
 void Link::start(uint32_t now)
 {
+    // the module reopens the UART at the base speed, after a failure it is there already
+    curBaud = OTP_BAUD;
+    glitching = false;
+
     note(opened ? "idle: silence over, heartbeat" : "link open, heartbeat");
     if (!opened) {
         opened = true;
@@ -340,6 +344,7 @@ void Link::onFrame(uint8_t type, uint32_t nonce, uint32_t now)
                 return fail(now, "HB after %ums", (unsigned)dt);
             lastHb = now;
             hbValid = true;
+            hbGapUs = 0;
             if (elapsed(now, lastLog) >= 1000) {
                 lastLog = now;
                 rx.put("HB %ums", (unsigned)dt);
@@ -564,6 +569,12 @@ void Link::pumpAccept(uint32_t now)
 
 void Link::poll(uint32_t now)
 {
+    // longest time between two polls since the peer's last heartbeat, to explain a missed one
+    uint32_t us = port.us();
+    if (prevPollUs && us - prevPollUs > hbGapUs)
+        hbGapUs = us - prevPollUs;
+    prevPollUs = us;
+
     switch (state_) {
     case SLEEP:
         while (port.read() >= 0) {
@@ -620,7 +631,7 @@ void Link::poll(uint32_t now)
     } else if (state_ == LINKED) {
         uint32_t limit = hbValid ? HB_MAX_MS : HB_FIRST_MS;
         if (elapsed(now, hbValid ? lastHb : enteredAt) > limit)
-            fail(now, "HB missed");
+            fail(now, "HB missed, loop gap %ums", (unsigned)(hbGapUs / 1000));
     }
 }
 } // namespace otp
