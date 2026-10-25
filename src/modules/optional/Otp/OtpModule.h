@@ -28,6 +28,7 @@ class OtpModule : public MeshModule, public Observable<const UIFrameEvent *>, pr
   protected:
     int32_t runOnce() override;
     bool wantUIFrame() override { return true; }
+    bool interceptingKeyboardInput() override;
     bool wantPacket(const meshtastic_MeshPacket *) override { return false; }
     Observable<const UIFrameEvent *> *getUIFrameObservable() override { return this; }
 

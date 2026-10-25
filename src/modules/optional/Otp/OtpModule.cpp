@@ -3,7 +3,9 @@
 #if defined(OTP_APP) && defined(OTP_UART_TX) && HAS_SCREEN
 
 #include "esp_random.h"
+#include "graphics/Screen.h"
 #include "graphics/ScreenFonts.h"
+#include "main.h"
 #include "mesh/Throttle.h"
 #include <HardwareSerial.h>
 
@@ -83,13 +85,37 @@ void OtpModule::taskLoop()
     }
 }
 
+// While our frame is on screen the keys are ours. Without this Screen treats a space as "next frame" (Screen.cpp, ANYKEY ' ')
+// and carried the user off the test screen on every press. Interception stops 3 s after the last draw.
+bool OtpModule::interceptingKeyboardInput()
+{
+    return open && lastDraw != 0 && Throttle::isWithinTimespanMs(lastDraw, 3000);
+}
+
 int OtpModule::onInput(const InputEvent *event)
 {
-    if (!open)
+    if (!interceptingKeyboardInput())
         return 0;
-    // space is the only key: next test group once the link is idle
-    if (event->kbchar == ' ')
+
+    // space is the only test key: next test group once the link is idle
+    if (event->inputEvent == INPUT_BROKER_ANYKEY && event->kbchar == ' ') {
         keySpace = true;
+        return 0;
+    }
+
+    // Screen ignores navigation while a module intercepts, so the way out is ours: left and back go to the previous frame,
+    // right and press to the next, long up and down likewise. lastDraw reset ends the interception at once.
+    bool prev = event->inputEvent == INPUT_BROKER_LEFT || event->inputEvent == INPUT_BROKER_BACK ||
+                event->inputEvent == INPUT_BROKER_UP_LONG;
+    bool next = event->inputEvent == INPUT_BROKER_RIGHT || event->inputEvent == INPUT_BROKER_USER_PRESS ||
+                event->inputEvent == INPUT_BROKER_DOWN_LONG;
+    if ((prev || next) && screen) {
+        lastDraw = 0;
+        if (prev)
+            screen->showPrevFrame();
+        else
+            screen->showNextFrame();
+    }
     return 0;
 }
 
